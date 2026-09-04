@@ -15,6 +15,7 @@ for test in \
   SIXLABJITProjectManagerBridgeSmoke.py \
   SIXLABJITProjectManagerBridgePairSmoke.py \
   SIXLABJITProjectManagerBridgeVendorSmoke.py \
+  SIXLABJITProjectManagerBridgeInstalledVendorSmoke.py \
   SIXLABJITProjectManagerBridgeProductionCollectorSmoke.py; do
   python3 "$ROOT/tests/$test"
 done

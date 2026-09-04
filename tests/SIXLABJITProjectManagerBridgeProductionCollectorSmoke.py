@@ -20,7 +20,7 @@ assert spec.loader is not None
 spec.loader.exec_module(bridge)
 
 test_node = Path(shutil.which("node") or "").resolve(strict=True)
-validator = bridge._pinned_validator()
+validator = bridge._fixture_pinned_validator()
 collector = bridge._vendored_b()["scripts/ci/collect-pr-runner-correlation.mjs"]
 
 # A developer machine cannot self-admit a Homebrew/UID-owned Node. Production

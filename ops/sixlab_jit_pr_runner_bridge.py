@@ -43,13 +43,51 @@ VENDOR_FILES = {
 # Installation is a separate, root-administered activation step.  In
 # particular, this is not derived from PATH, a user configuration directory,
 # or a developer's Homebrew installation.
-NODE_TRUST_MANIFEST = Path("/etc/opcb/sixlab-jit-node-trust-v1.json")
-NODE_TRUST_SCHEMA = "opcb-sixlab-jit-node-trust-v1"
+NODE_TRUST_MANIFEST = Path("/etc/opcb/sixlab-jit-node-trust-v2.json")
+NODE_TRUST_SCHEMA = "opcb-sixlab-jit-node-trust-v2"
+# This is deliberately an installation location, not a location underneath
+# this checkout.  A root-administered installer may copy the reviewed source
+# vendor here, but the bridge never executes the checkout copy in production.
+INSTALLED_VENDOR_ROOT = Path("/var/lib/opcb/sixlab-jit/vendor/sixlab-pr1201")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+class _VerifiedFile:
+    """A root-owned regular file whose identity and bytes were checked."""
+
+    def __init__(
+        self, path: Path, device: int, inode: int, mode: int, uid: int,
+        digest: str, contents: bytes | None = None, immutable: bool = False,
+    ) -> None:
+        self.path = path
+        self.device = device
+        self.inode = inode
+        self.mode = mode
+        self.uid = uid
+        self.digest = digest
+        self.contents = contents
+        self.immutable = immutable
+
+
+class _InstalledVendor:
+    """The fixed installed B bundle used for one production cycle."""
+
+    def __init__(self, root: Path, files: dict[str, _VerifiedFile]) -> None:
+        self.root = root
+        self.files = files
+
+    def executable_path(self, relative: str) -> Path:
+        verified = self.files[relative]
+        # The parent hierarchy is root-owned and non-writable, so an
+        # unprivileged caller cannot race this check with the exec below.  The
+        # identity comparison additionally makes a privileged/path drift fail
+        # closed before either collector or validator starts.
+        _same_verified_file(verified, f"installed SIXLAB file {relative}")
+        return verified.path
 
 
 def _digest(value: bytes) -> str:
@@ -63,6 +101,11 @@ def _record(value: object, keys: set[str], label: str) -> dict[str, Any]:
 
 
 def _regular_bytes(path: Path, label: str) -> bytes:
+    """Read a non-symlink regular source file for fixture/install validation.
+
+    This deliberately does *not* establish a production trust boundary.  See
+    ``_verified_root_owned_file`` for the installation-time execution path.
+    """
     try:
         metadata = path.lstat()
         raw = path.read_bytes()
@@ -76,7 +119,12 @@ def _regular_bytes(path: Path, label: str) -> bytes:
 
 
 def _vendored_b() -> dict[str, Path]:
-    """Return only the path/digest/provenance-pinned B files in this repo."""
+    """Return checked checkout vendor files for tests and installation only.
+
+    No production entry point calls this function.  A working tree is mutable
+    by its checkout owner even if the individual bytes happened to match at
+    validation time.
+    """
     root = VENDOR_ROOT
     manifest = root / "provenance.json"
     manifest_raw = _regular_bytes(manifest, "vendored SIXLAB provenance manifest")
@@ -102,13 +150,16 @@ def _vendored_b() -> dict[str, Path]:
     return files
 
 
-def _pinned_validator() -> Path:
+def _fixture_pinned_validator() -> Path:
+    """Return the checkout validator only for non-admitting fixture tests."""
     return _vendored_b()["scripts/ci/pr-runner-contract.mjs"]
 
 
-def _canonical_validation(correlation: object, validator: Path, node: Path) -> dict[str, Any]:
+def _canonical_validation(
+    correlation: object, validator: Path, node: Path, *, expected_validator: Path | None = None,
+) -> dict[str, Any]:
     """Run B's fixed validator and retain only its contract-derived output."""
-    pinned_validator = _pinned_validator()
+    pinned_validator = expected_validator or _fixture_pinned_validator()
     if validator != pinned_validator:
         raise BridgeError("canonical SIXLAB validator path is invalid")
     validator = pinned_validator
@@ -142,54 +193,153 @@ def _canonical_validation(correlation: object, validator: Path, node: Path) -> d
     return result
 
 
+def _safe_root_metadata(metadata: os.stat_result, label: str, *, immutable: bool = False) -> None:
+    if metadata.st_uid != 0:
+        raise BridgeError(f"{label} is not root-owned")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise BridgeError(f"{label} has unsafe write permissions")
+    if immutable and metadata.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+        raise BridgeError(f"{label} is not immutable")
+
+
 def _root_owned_safe_path(path: Path, label: str) -> None:
-    """Require a root-owned, non-writable path and every absolute parent."""
+    """Require an absolute root-owned non-symlink path and every parent."""
+    if not path.is_absolute():
+        raise BridgeError(f"{label} must be an absolute path")
     current = path
     while True:
         try:
             metadata = current.lstat()
         except OSError as error:
             raise BridgeError(f"{label} is unreadable") from error
-        if current.is_symlink() or metadata.st_uid != 0:
-            raise BridgeError(f"{label} is not root-owned")
-        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise BridgeError(f"{label} has unsafe write permissions")
+        if stat.S_ISLNK(metadata.st_mode):
+            raise BridgeError(f"{label} must not traverse a symlink")
+        _safe_root_metadata(metadata, label)
         if current == current.parent:
             return
         current = current.parent
 
 
-def _trusted_node() -> Path:
-    """Load one root-administered path/digest-pinned Node executable."""
+def _verified_root_owned_file(
+    path: Path, label: str, expected_digest: str | None, *, immutable: bool = False,
+) -> _VerifiedFile:
+    """Open and verify a root-installed immutable regular file without links.
+
+    ``O_NOFOLLOW`` and the lstat/fstat identity check reject a replacement that
+    happens between pathname resolution and reading.  The entire parent chain
+    is separately root-owned and not group/other writable; therefore the
+    subsequent subprocess path cannot be replaced by the checkout owner.
+    """
+    _root_owned_safe_path(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise BridgeError(f"{label} is unreadable") from error
+    try:
+        opened = os.fstat(descriptor)
+        listed = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(listed.st_mode)
+            or opened.st_dev != listed.st_dev
+            or opened.st_ino != listed.st_ino
+        ):
+            raise BridgeError(f"{label} changed while it was verified")
+        _safe_root_metadata(opened, label, immutable=immutable)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    digest = _digest(raw)
+    if not raw or (expected_digest is not None and digest != expected_digest):
+        raise BridgeError(f"{label} digest drifted")
+    return _VerifiedFile(
+        path=path,
+        device=opened.st_dev,
+        inode=opened.st_ino,
+        mode=stat.S_IMODE(opened.st_mode),
+        uid=opened.st_uid,
+        digest=digest,
+        contents=raw,
+        immutable=immutable,
+    )
+
+
+def _same_verified_file(verified: _VerifiedFile, label: str) -> None:
+    """Reject post-validation inode, ownership, mode, link, or byte drift."""
+    _root_owned_safe_path(verified.path, label)
+    current = _verified_root_owned_file(
+        verified.path, label, verified.digest, immutable=verified.immutable,
+    )
+    if (
+        current.device != verified.device
+        or current.inode != verified.inode
+        or current.mode != verified.mode
+        or current.uid != verified.uid
+    ):
+        raise BridgeError(f"{label} identity drifted after verification")
+
+
+def _trusted_runtime() -> tuple[_VerifiedFile, _InstalledVendor]:
+    """Load the root-administered Node and installed B bundle for production."""
     manifest = NODE_TRUST_MANIFEST
-    _root_owned_safe_path(manifest, "Node trust manifest")
-    manifest_raw = _regular_bytes(manifest, "Node trust manifest")
+    verified_manifest = _verified_root_owned_file(
+        manifest, "Node trust manifest", None, immutable=True,
+    )
+    assert verified_manifest.contents is not None
+    manifest_raw = verified_manifest.contents
     try:
         parsed = json.loads(manifest_raw)
     except json.JSONDecodeError as error:
         raise BridgeError("Node trust manifest is invalid JSON") from error
-    if (not isinstance(parsed, dict) or set(parsed) != {"schema", "node"}
+    if (not isinstance(parsed, dict) or set(parsed) != {"schema", "node", "vendor"}
             or parsed.get("schema") != NODE_TRUST_SCHEMA
             or not isinstance(parsed.get("node"), dict)
-            or set(parsed["node"]) != {"path", "sha256"}):
+            or set(parsed["node"]) != {"path", "sha256"}
+            or not isinstance(parsed.get("vendor"), dict)
+            or set(parsed["vendor"]) != {"root", "provenance_sha256", "files"}):
         raise BridgeError("Node trust manifest fields are not canonical")
     node_path = parsed["node"]["path"]
     expected_digest = parsed["node"]["sha256"]
     if (not isinstance(node_path, str) or not node_path.startswith("/")
             or not isinstance(expected_digest, str) or not _SHA256.fullmatch(expected_digest)):
         raise BridgeError("Node trust manifest binding is invalid")
-    node = Path(node_path)
-    _root_owned_safe_path(node, "trusted Node executable")
-    try:
-        metadata = node.lstat()
-        raw = node.read_bytes()
-    except OSError as error:
-        raise BridgeError("trusted Node executable is unreadable") from error
-    if (node.is_symlink() or not stat.S_ISREG(metadata.st_mode)
-            or not (metadata.st_mode & stat.S_IXUSR)
-            or _digest(raw) != expected_digest):
+    node = _verified_root_owned_file(Path(node_path), "trusted Node executable", expected_digest)
+    if not (node.mode & stat.S_IXUSR):
         raise BridgeError("trusted Node executable binding is invalid")
-    return node
+    vendor = parsed["vendor"]
+    if (
+        vendor.get("root") != str(INSTALLED_VENDOR_ROOT)
+        or vendor.get("provenance_sha256") != CANONICAL_MANIFEST_SHA256
+        or vendor.get("files") != VENDOR_FILES
+    ):
+        raise BridgeError("Node trust manifest installed vendor binding is invalid")
+    _root_owned_safe_path(INSTALLED_VENDOR_ROOT, "installed SIXLAB vendor root")
+    if not stat.S_ISDIR(INSTALLED_VENDOR_ROOT.lstat().st_mode):
+        raise BridgeError("installed SIXLAB vendor root is not a directory")
+    files = {
+        "provenance.json": _verified_root_owned_file(
+            INSTALLED_VENDOR_ROOT / "provenance.json",
+            "installed SIXLAB provenance manifest", CANONICAL_MANIFEST_SHA256, immutable=True,
+        ),
+    }
+    for relative, expected in VENDOR_FILES.items():
+        files[relative] = _verified_root_owned_file(
+            INSTALLED_VENDOR_ROOT / relative,
+            f"installed SIXLAB file {relative}", expected, immutable=True,
+        )
+    return node, _InstalledVendor(root=INSTALLED_VENDOR_ROOT, files=files)
+
+
+def _trusted_node() -> Path:
+    """Compatibility helper for tests; production uses ``_trusted_runtime``."""
+    return _trusted_runtime()[0].path
 
 
 def _test_node(test_node: Path | None) -> Path:
@@ -217,10 +367,18 @@ def _collector_environment() -> dict[str, str]:
     return {"GITHUB_TOKEN": token}
 
 
-def _collect_live_correlation(node: Path) -> object:
-    """Run B's read-only GitHub collector; caller data cannot replace this."""
-    files = _vendored_b()
-    collector = files["scripts/ci/collect-pr-runner-correlation.mjs"]
+def _collect_live_correlation(node: Path, installed_vendor: _InstalledVendor | None = None) -> object:
+    """Run B's read-only GitHub collector; caller data cannot replace this.
+
+    ``installed_vendor`` is mandatory for production.  The fallback exists
+    solely for the non-admitting test seam below, and is deliberately unable
+    to reach ``build_cycle``.
+    """
+    collector = (
+        installed_vendor.executable_path("scripts/ci/collect-pr-runner-correlation.mjs")
+        if installed_vendor is not None
+        else _vendored_b()["scripts/ci/collect-pr-runner-correlation.mjs"]
+    )
     completed = subprocess.run(
         [str(node), str(collector), "--stdout"], env=_collector_environment(),
         capture_output=True, text=True, check=False,
@@ -243,6 +401,8 @@ def _build_from_validated_correlation(
     evidence_by_pull: object,
     canonical_validator: Path,
     node: Path,
+    *,
+    installed_vendor: _InstalledVendor | None = None,
 ) -> dict[str, Any]:
     """Build R1 observations after the SIXLAB validator accepts correlation.
 
@@ -252,7 +412,15 @@ def _build_from_validated_correlation(
     identity. This private helper only serves the trusted collector entrypoint
     and non-admitting fixture validation.
     """
-    validated = _canonical_validation(correlation, canonical_validator, node)
+    validator = (
+        installed_vendor.executable_path("scripts/ci/pr-runner-contract.mjs")
+        if installed_vendor is not None else canonical_validator
+    )
+    if validator != canonical_validator:
+        raise BridgeError("installed SIXLAB validator path drifted")
+    validated = _canonical_validation(
+        correlation, validator, node, expected_validator=canonical_validator,
+    )
     source = _record(correlation, {"schema", "observedAt", "repository", "openPullRequests", "runs"}, "correlation")
     if source["schema"] != CORRELATION_SCHEMA or source["repository"] != shadow.EXPECTED_REPOSITORY:
         raise BridgeError("correlation schema or repository is invalid")
@@ -365,13 +533,17 @@ def _build_from_validated_correlation(
 
 def build_cycle(selections: object, evidence_by_pull: object) -> dict[str, Any]:
     """Build a schedulable cycle from B's freshly collected live inventory."""
-    # Verify the executable once, then use those exact verified bytes for both
-    # collector and validator in this cycle.
-    node = _trusted_node()
-    correlation = _collect_live_correlation(node)
+    # The installed manifest binds the Node executable and the *installed*
+    # immutable B source.  The checkout vendor never crosses this boundary.
+    verified_node, installed_vendor = _trusted_runtime()
+    _same_verified_file(verified_node, "trusted Node executable")
+    node = verified_node.path
+    correlation = _collect_live_correlation(node, installed_vendor)
+    _same_verified_file(verified_node, "trusted Node executable")
     return _build_from_validated_correlation(
         correlation, selections, evidence_by_pull,
-        _pinned_validator(), node,
+        installed_vendor.executable_path("scripts/ci/pr-runner-contract.mjs"), node,
+        installed_vendor=installed_vendor,
     )
 
 
@@ -384,7 +556,7 @@ def validate_test_fixture(
 ) -> dict[str, Any]:
     """Validate a fixture without returning a cycle that scheduling can consume."""
     _build_from_validated_correlation(
-        correlation, selections, evidence_by_pull, _pinned_validator(), _test_node(test_node),
+        correlation, selections, evidence_by_pull, _fixture_pinned_validator(), _test_node(test_node),
     )
     return {
         "schema": "sixlab-jit-bridge-test-fixture-v1",
