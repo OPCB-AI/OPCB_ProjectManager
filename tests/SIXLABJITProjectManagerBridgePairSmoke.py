@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import sys
 
 
@@ -22,15 +23,16 @@ spec.loader.exec_module(bridge)
 correlation_path = project / "tests" / "fixtures" / "sixlab-pr-runner-correlation-v2.json"
 assert correlation_path.is_file()
 correlation = json.loads(correlation_path.read_text(encoding="utf-8"))
+test_node = Path(shutil.which("node") or "").resolve(strict=True)
 
 host = {"observed_at": "2026-09-04T00:02:00Z", "global_lock_held": False, "active_services": [], "service_details": [], "dedicated_process_count": 0, "run_directories": [], "mounts": [], "egress_rules": [], "runner_inventory": [], "user_manager_active": False, "load5": 0.2, "root_free_bytes": 20 * 1024 * 1024 * 1024, "memory_available_bytes": 4 * 1024 * 1024 * 1024, "swap_free_bytes": 1024 * 1024 * 1024}
 evidence = {42: {"headObservations": [{"observed_at": "2026-09-04T00:00:00Z", "head_sha": "a" * 40}, {"observed_at": "2026-09-04T00:01:00Z", "head_sha": "a" * 40}], "host": host, "allocation": None, "receipt": None}}
-assert bridge.validate_test_fixture(correlation, {42: "test"}, evidence)["status"] == "CHECK-INCOMPLETE"
+assert bridge.validate_test_fixture(correlation, {42: "test"}, evidence, test_node=test_node)["status"] == "CHECK-INCOMPLETE"
 attack = copy.deepcopy(correlation)
 attack["runs"][0]["jobs"].append(copy.deepcopy(attack["runs"][1]["jobs"][0]))
 attack["runs"][0]["jobs"][-1].update({"runId": 101, "runAttempt": 2})
 try:
-    bridge.validate_test_fixture(attack, {42: "test"}, evidence)
+    bridge.validate_test_fixture(attack, {42: "test"}, evidence, test_node=test_node)
 except bridge.BridgeError as error:
     assert "canonical SIXLAB contract rejected correlation" in str(error)
 else:
@@ -39,7 +41,7 @@ else:
 missing_backend = copy.deepcopy(correlation)
 missing_backend["runs"] = [row for row in missing_backend["runs"] if row["workflow"] != "test-backend"]
 try:
-    bridge.validate_test_fixture(missing_backend, {42: "test"}, evidence)
+    bridge.validate_test_fixture(missing_backend, {42: "test"}, evidence, test_node=test_node)
 except bridge.BridgeError as error:
     assert "canonical SIXLAB contract rejected correlation" in str(error)
 else:

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 
 
@@ -601,7 +602,10 @@ with tempfile.TemporaryDirectory(prefix="sixlab-jit-collector.") as temporary:
     # A correlation file can only exercise fixture validation; neither the
     # fixture nor the old CLI can make a schedulable production cycle.
     fixture_evidence = json.loads(evidence_path.read_text())
-    fixture = bridge.validate_test_fixture(correlation, {42: "test"}, {42: fixture_evidence["42"]})
+    fixture = bridge.validate_test_fixture(
+        correlation, {42: "test"}, {42: fixture_evidence["42"]},
+        test_node=Path(shutil.which("node") or "").resolve(strict=True),
+    )
     assert fixture["status"] == "CHECK-INCOMPLETE"
     assert fixture["live_mutation_allowed"] is False
     assert fixture["token_allowed"] is False

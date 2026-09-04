@@ -40,14 +40,12 @@ VENDOR_FILES = {
     "scripts/ci/collect-pr-runner-correlation.test.mjs": "ba774eda78b020edf5a9189863f1f0529cc1cf80838a07b88178f9fe670b763f",
     "scripts/ci/pr-runner-contract.mjs": CANONICAL_VALIDATOR_SHA256,
 }
-PROXY_AND_CA_ENV = (
-    "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "all_proxy", "http_proxy", "https_proxy", "no_proxy",
-    "NODE_EXTRA_CA_CERTS", "SSL_CERT_DIR", "SSL_CERT_FILE",
-)
-TRUSTED_NODE_CANDIDATES = (
-    Path("/opt/homebrew/bin/node"), Path("/usr/local/bin/node"), Path("/usr/bin/node"),
-)
+# Installation is a separate, root-administered activation step.  In
+# particular, this is not derived from PATH, a user configuration directory,
+# or a developer's Homebrew installation.
+NODE_TRUST_MANIFEST = Path("/etc/opcb/sixlab-jit-node-trust-v1.json")
+NODE_TRUST_SCHEMA = "opcb-sixlab-jit-node-trust-v1"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BridgeError(RuntimeError):
@@ -108,7 +106,7 @@ def _pinned_validator() -> Path:
     return _vendored_b()["scripts/ci/pr-runner-contract.mjs"]
 
 
-def _canonical_validation(correlation: object, validator: Path) -> dict[str, Any]:
+def _canonical_validation(correlation: object, validator: Path, node: Path) -> dict[str, Any]:
     """Run B's fixed validator and retain only its contract-derived output."""
     pinned_validator = _pinned_validator()
     if validator != pinned_validator:
@@ -119,10 +117,13 @@ def _canonical_validation(correlation: object, validator: Path) -> dict[str, Any
     except (TypeError, ValueError) as error:
         raise BridgeError("correlation cannot be encoded for canonical validation") from error
     completed = subprocess.run(
-        ["node", str(validator), "--validate-snapshot-stdin"],
+        [str(node), str(validator), "--validate-snapshot-stdin"],
         input=source,
         capture_output=True,
         text=True,
+        # Validator input is untrusted correlation JSON.  It has no need for a
+        # credential, PATH, Node flags/module paths, proxy, or CA settings.
+        env={},
         check=False,
     )
     if completed.returncode != 0:
@@ -141,48 +142,85 @@ def _canonical_validation(correlation: object, validator: Path) -> dict[str, Any
     return result
 
 
-def _trusted_node() -> Path:
-    """Resolve a system Node binary without consulting PATH or shell state."""
-    for candidate in TRUSTED_NODE_CANDIDATES:
+def _root_owned_safe_path(path: Path, label: str) -> None:
+    """Require a root-owned, non-writable path and every absolute parent."""
+    current = path
+    while True:
         try:
-            resolved = candidate.resolve(strict=True)
-            metadata = resolved.lstat()
-        except OSError:
-            continue
-        if (not stat.S_ISREG(metadata.st_mode)
-                or not (metadata.st_mode & stat.S_IXUSR)
-                or metadata.st_uid not in {0, os.geteuid()}
-                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-            continue
-        return resolved
-    raise BridgeError("no trusted Node executable is available")
+            metadata = current.lstat()
+        except OSError as error:
+            raise BridgeError(f"{label} is unreadable") from error
+        if current.is_symlink() or metadata.st_uid != 0:
+            raise BridgeError(f"{label} is not root-owned")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise BridgeError(f"{label} has unsafe write permissions")
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+def _trusted_node() -> Path:
+    """Load one root-administered path/digest-pinned Node executable."""
+    manifest = NODE_TRUST_MANIFEST
+    _root_owned_safe_path(manifest, "Node trust manifest")
+    manifest_raw = _regular_bytes(manifest, "Node trust manifest")
+    try:
+        parsed = json.loads(manifest_raw)
+    except json.JSONDecodeError as error:
+        raise BridgeError("Node trust manifest is invalid JSON") from error
+    if (not isinstance(parsed, dict) or set(parsed) != {"schema", "node"}
+            or parsed.get("schema") != NODE_TRUST_SCHEMA
+            or not isinstance(parsed.get("node"), dict)
+            or set(parsed["node"]) != {"path", "sha256"}):
+        raise BridgeError("Node trust manifest fields are not canonical")
+    node_path = parsed["node"]["path"]
+    expected_digest = parsed["node"]["sha256"]
+    if (not isinstance(node_path, str) or not node_path.startswith("/")
+            or not isinstance(expected_digest, str) or not _SHA256.fullmatch(expected_digest)):
+        raise BridgeError("Node trust manifest binding is invalid")
+    node = Path(node_path)
+    _root_owned_safe_path(node, "trusted Node executable")
+    try:
+        metadata = node.lstat()
+        raw = node.read_bytes()
+    except OSError as error:
+        raise BridgeError("trusted Node executable is unreadable") from error
+    if (node.is_symlink() or not stat.S_ISREG(metadata.st_mode)
+            or not (metadata.st_mode & stat.S_IXUSR)
+            or _digest(raw) != expected_digest):
+        raise BridgeError("trusted Node executable binding is invalid")
+    return node
+
+
+def _test_node(test_node: Path | None) -> Path:
+    """Verify an explicit test-only Node override for fixture validation.
+
+    This never reaches ``build_cycle`` and returns a non-admitting fixture, so
+    it cannot become an installation shortcut or a production trust root.
+    """
+    if test_node is None or not test_node.is_absolute():
+        raise BridgeError("test fixture requires an explicit absolute test-only Node executable")
+    try:
+        metadata = test_node.lstat()
+    except OSError as error:
+        raise BridgeError("test-only Node executable is unreadable") from error
+    if test_node.is_symlink() or not stat.S_ISREG(metadata.st_mode) or not (metadata.st_mode & stat.S_IXUSR):
+        raise BridgeError("test-only Node executable is invalid")
+    return test_node
 
 
 def _collector_environment() -> dict[str, str]:
-    """Pass only collector inputs that cannot load code into Node."""
-    unsafe = [name for name in os.environ if (
-        name in {"LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH"}
-        or (name.startswith("NODE_") and name != "NODE_EXTRA_CA_CERTS")
-    )]
+    """Pass only the short-lived GitHub read token to the collector."""
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise BridgeError("canonical SIXLAB live collector requires GITHUB_TOKEN")
-    environment = {"GITHUB_TOKEN": token}
-    for name in PROXY_AND_CA_ENV:
-        if name in os.environ:
-            environment[name] = os.environ[name]
-    # Deliberately do not inherit ``unsafe``.  Keeping this explicit scan makes
-    # new Node/dynamic-loader variables visible in review while preserving a
-    # bare local test command on hosts that set harmless Node telemetry values.
-    _ = unsafe
-    return environment
+    return {"GITHUB_TOKEN": token}
 
 
-def _collect_live_correlation() -> object:
+def _collect_live_correlation(node: Path) -> object:
     """Run B's read-only GitHub collector; caller data cannot replace this."""
     files = _vendored_b()
     collector = files["scripts/ci/collect-pr-runner-correlation.mjs"]
-    node = _trusted_node()
     completed = subprocess.run(
         [str(node), str(collector), "--stdout"], env=_collector_environment(),
         capture_output=True, text=True, check=False,
@@ -204,6 +242,7 @@ def _build_from_validated_correlation(
     selections: object,
     evidence_by_pull: object,
     canonical_validator: Path,
+    node: Path,
 ) -> dict[str, Any]:
     """Build R1 observations after the SIXLAB validator accepts correlation.
 
@@ -213,7 +252,7 @@ def _build_from_validated_correlation(
     identity. This private helper only serves the trusted collector entrypoint
     and non-admitting fixture validation.
     """
-    validated = _canonical_validation(correlation, canonical_validator)
+    validated = _canonical_validation(correlation, canonical_validator, node)
     source = _record(correlation, {"schema", "observedAt", "repository", "openPullRequests", "runs"}, "correlation")
     if source["schema"] != CORRELATION_SCHEMA or source["repository"] != shadow.EXPECTED_REPOSITORY:
         raise BridgeError("correlation schema or repository is invalid")
@@ -326,16 +365,27 @@ def _build_from_validated_correlation(
 
 def build_cycle(selections: object, evidence_by_pull: object) -> dict[str, Any]:
     """Build a schedulable cycle from B's freshly collected live inventory."""
-    correlation = _collect_live_correlation()
+    # Verify the executable once, then use those exact verified bytes for both
+    # collector and validator in this cycle.
+    node = _trusted_node()
+    correlation = _collect_live_correlation(node)
     return _build_from_validated_correlation(
         correlation, selections, evidence_by_pull,
-        _pinned_validator(),
+        _pinned_validator(), node,
     )
 
 
-def validate_test_fixture(correlation: object, selections: object, evidence_by_pull: object) -> dict[str, Any]:
+def validate_test_fixture(
+    correlation: object,
+    selections: object,
+    evidence_by_pull: object,
+    *,
+    test_node: Path | None,
+) -> dict[str, Any]:
     """Validate a fixture without returning a cycle that scheduling can consume."""
-    _build_from_validated_correlation(correlation, selections, evidence_by_pull, _pinned_validator())
+    _build_from_validated_correlation(
+        correlation, selections, evidence_by_pull, _pinned_validator(), _test_node(test_node),
+    )
     return {
         "schema": "sixlab-jit-bridge-test-fixture-v1",
         "status": "CHECK-INCOMPLETE",

@@ -41,16 +41,22 @@ bridge can select a one-run R1 snapshot. The fixed live collector and contract,
 not ProjectManager caller JSON, derive the PR universe and
 workflow-to-family/job-instance map.
 
-The bridge resolves a trusted system Node executable from fixed locations,
-realpaths it, and requires a regular executable owned by root or the current
-user with no group/world write permission. It never resolves `node` through
-`PATH`. Before spawning Node it strips inherited `NODE_OPTIONS`, `NODE_PATH`,
-all other `NODE_*` values except `NODE_EXTRA_CA_CERTS`, and dynamic-loader
-variables. The child receives only `GITHUB_TOKEN` plus an explicit proxy/CA
-allowlist; no module, loader, require, inspector, or test-seam environment is
-passed. A collector failure, incomplete page, closing drift, unsafe executable,
-vendor drift, or missing token fails closed. Fixture paths are
-explicit test-only validation and return `CHECK-INCOMPLETE` with
+Production activation requires the fixed root-owned, non-group/world-writable
+manifest `/etc/opcb/sixlab-jit-node-trust-v1.json`. It binds one absolute,
+regular, root-owned Node executable and its SHA-256; the executable and every
+parent directory through `/` must also be root-owned and non-group/world
+writable. The bridge never resolves `node` through `PATH`, trusts a current
+UID-owned executable, or treats a Homebrew installation as a trust root. One
+verified absolute executable is used for both collector and validator in the
+same cycle. The collector receives only the short-lived `GITHUB_TOKEN`. The
+validator receives an empty environment: no token, `PATH`, `NODE_OPTIONS`,
+`NODE_PATH`, loaders, requires, inspectors, proxies, or CA variables. Parent
+proxy/CA values are never inherited; a deployment needing either remains
+fail-closed until a separately reviewed root-owned installation configuration
+adds and verifies that capability. A missing/invalid manifest, digest drift,
+collector failure, incomplete page, closing drift, unsafe executable, vendor
+drift, or missing token fails closed. Fixture paths require an explicit
+test-only absolute Node override and return `CHECK-INCOMPLETE` with
 `live_mutation_allowed=false` and `token_allowed=false`; they cannot emit a
 schedulable cycle or reach the actuator.
 The bridge still requires one explicit workflow selection for every PR; it
