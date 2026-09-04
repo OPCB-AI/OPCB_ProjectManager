@@ -28,15 +28,29 @@ there is no static PR allowlist. R1's SPA `any-one-same-label` behavior stays
 intact: a shard becomes actual only after GitHub's binding and a second shard
 cannot proceed before terminal teardown is independently observed.
 
-The production ProjectManager bridge directly invokes SIXLAB's digest-pinned
-`collect-pr-runner-correlation.mjs`, which itself paginates every open,
-non-draft `main` PR and every required workflow, then closes with PR/run/job
-readbacks. Its adjacent fixed, reviewed `pr-runner-contract.mjs` validates the
-result before the bridge can select a one-run R1 snapshot. The fixed live
-collector and contract, not ProjectManager caller JSON, derive the PR universe
-and workflow-to-family/job-instance map; a collector failure, incomplete page,
-closing drift, fake path, or digest drift fails closed. Fixture/injection paths
-are explicit test-only validation and return `CHECK-INCOMPLETE` with
+The production ProjectManager bridge directly invokes its checked-in copy of
+SIXLAB PR #1201 at exact head `1efdfd2d754822d29d4f0a4f93b48117a663116f`:
+`vendor/sixlab-pr1201/scripts/ci/collect-pr-runner-correlation.mjs`. The
+vendor provenance manifest binds the B repository, PR, head, original paths,
+and SHA-256 values for the collector, validator, and contract; the bridge also
+pins the manifest digest in code. Replaced paths, manifest bytes, or vendor
+files therefore fail closed. The collector paginates every open, non-draft
+`main` PR and every required workflow, then closes with PR/run/job readbacks.
+Its adjacent fixed `pr-runner-contract.mjs` validates the result before the
+bridge can select a one-run R1 snapshot. The fixed live collector and contract,
+not ProjectManager caller JSON, derive the PR universe and
+workflow-to-family/job-instance map.
+
+The bridge resolves a trusted system Node executable from fixed locations,
+realpaths it, and requires a regular executable owned by root or the current
+user with no group/world write permission. It never resolves `node` through
+`PATH`. Before spawning Node it strips inherited `NODE_OPTIONS`, `NODE_PATH`,
+all other `NODE_*` values except `NODE_EXTRA_CA_CERTS`, and dynamic-loader
+variables. The child receives only `GITHUB_TOKEN` plus an explicit proxy/CA
+allowlist; no module, loader, require, inspector, or test-seam environment is
+passed. A collector failure, incomplete page, closing drift, unsafe executable,
+vendor drift, or missing token fails closed. Fixture paths are
+explicit test-only validation and return `CHECK-INCOMPLETE` with
 `live_mutation_allowed=false` and `token_allowed=false`; they cannot emit a
 schedulable cycle or reach the actuator.
 The bridge still requires one explicit workflow selection for every PR; it

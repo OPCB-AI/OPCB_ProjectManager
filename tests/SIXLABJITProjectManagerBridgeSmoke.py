@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -30,8 +31,6 @@ fixtures = project / "tests" / "fixtures"
 fixture_path = fixtures / "sixlab-pr-runner-correlation-v2.json"
 assert fixture_path.is_file(), f"missing paired SIXLAB bridge fixture: {fixture_path}"
 correlation = json.loads(fixture_path.read_text(encoding="utf-8"))
-validator = Path(os.environ["SIXLAB_CI_CONTRACT_VALIDATOR"])
-collector = validator.with_name("collect-pr-runner-correlation.mjs")
 
 host = {
     "observed_at": "2026-09-04T00:02:00Z", "global_lock_held": False,
@@ -56,7 +55,7 @@ evidence = {
 
 # Caller-provided JSON is a fixture-only seam.  It remains useful for shape
 # attacks, but cannot produce a cycle that a scheduler or actuator can admit.
-fixture = bridge.validate_test_fixture(correlation, {42: "test"}, evidence, validator)
+fixture = bridge.validate_test_fixture(correlation, {42: "test"}, evidence)
 assert fixture == {
     "schema": "sixlab-jit-bridge-test-fixture-v1",
     "status": "CHECK-INCOMPLETE",
@@ -73,7 +72,7 @@ else:
 
 missing_selection = copy.deepcopy(evidence)
 try:
-    bridge.validate_test_fixture(correlation, {}, missing_selection, validator)
+    bridge.validate_test_fixture(correlation, {}, missing_selection)
 except bridge.BridgeError as error:
     assert "every open PR" in str(error)
 else:
@@ -82,7 +81,7 @@ else:
 attempt_drift = copy.deepcopy(correlation)
 attempt_drift["runs"][0]["run"]["attempt"] = 1
 try:
-    bridge.validate_test_fixture(attempt_drift, {42: "test"}, evidence, validator)
+    bridge.validate_test_fixture(attempt_drift, {42: "test"}, evidence)
 except bridge.BridgeError as error:
     assert "canonical SIXLAB contract rejected correlation" in str(error)
 else:
@@ -93,7 +92,7 @@ cross_family["runs"][0]["jobs"].append(copy.deepcopy(cross_family["runs"][1]["jo
 cross_family["runs"][0]["jobs"][-1]["runId"] = 101
 cross_family["runs"][0]["jobs"][-1]["runAttempt"] = 2
 try:
-    bridge.validate_test_fixture(cross_family, {42: "test"}, evidence, validator)
+    bridge.validate_test_fixture(cross_family, {42: "test"}, evidence)
 except bridge.BridgeError as error:
     assert "canonical SIXLAB contract rejected correlation" in str(error)
 else:
@@ -104,7 +103,7 @@ else:
 missing_backend = copy.deepcopy(correlation)
 missing_backend["runs"] = [row for row in missing_backend["runs"] if row["workflow"] != "test-backend"]
 try:
-    bridge.validate_test_fixture(missing_backend, {42: "test"}, evidence, validator)
+    bridge.validate_test_fixture(missing_backend, {42: "test"}, evidence)
 except bridge.BridgeError as error:
     assert "canonical SIXLAB contract rejected correlation" in str(error)
 else:
@@ -117,59 +116,62 @@ removed_pr = copy.deepcopy(correlation)
 removed_pr["openPullRequests"] = []
 removed_pr["runs"] = []
 try:
-    bridge.build_cycle(removed_pr, {42: "test"}, evidence, validator)
+    bridge.build_cycle(removed_pr, {42: "test"}, evidence)
 except TypeError:
     pass
 else:
     raise AssertionError("production bridge accepted caller-supplied correlation JSON")
 
-# The production seam only accepts the digest-pinned B collector.  It then
-# fails closed before producing a cycle if the collector fails, emits nonsense,
-# or carries an explicit test-only configuration.
-try:
-    bridge.build_cycle({42: "test"}, evidence, validator)
-except bridge.BridgeError as error:
-    assert "collector digest or path drifted" in str(error)
-else:
-    raise AssertionError("production bridge accepted a validator as a collector")
-
+# The production seam has no caller-supplied collector or Node executable. It
+# fails closed before a subprocess starts without a token and rejects a Node
+# loader injection instead of inheriting it.
 previous_token = os.environ.get("GITHUB_TOKEN")
-previous_test_mode = os.environ.get("SIXLAB_CI_COLLECTOR_TEST_MODE")
-real_run = bridge.subprocess.run
-os.environ["GITHUB_TOKEN"] = "test-token-not-a-live-secret"
+previous_options = os.environ.get("NODE_OPTIONS")
+previous_path = os.environ.get("NODE_PATH")
 try:
-    bridge.subprocess.run = lambda *_args, **_kwargs: __import__("subprocess").CompletedProcess([], 1, "", "collector failed")
+    os.environ.pop("GITHUB_TOKEN", None)
     try:
-        bridge.build_cycle({42: "test"}, evidence, collector)
+        bridge.build_cycle({42: "test"}, evidence)
     except bridge.BridgeError as error:
-        assert "live collector failed" in str(error)
+        assert "requires GITHUB_TOKEN" in str(error)
     else:
-        raise AssertionError("collector failure produced a cycle")
+        raise AssertionError("tokenless production bridge produced a cycle")
 
-    bridge.subprocess.run = lambda *_args, **_kwargs: __import__("subprocess").CompletedProcess([], 0, "not-json", "")
-    try:
-        bridge.build_cycle({42: "test"}, evidence, collector)
-    except bridge.BridgeError as error:
-        assert "invalid JSON" in str(error)
-    else:
-        raise AssertionError("invalid collector output produced a cycle")
-
-    os.environ["SIXLAB_CI_COLLECTOR_TEST_MODE"] = "1"
-    try:
-        bridge.build_cycle({42: "test"}, evidence, collector)
-    except bridge.BridgeError as error:
-        assert "test-only" in str(error)
-    else:
-        raise AssertionError("test-only collector configuration produced a live cycle")
+    os.environ["GITHUB_TOKEN"] = "test-token-not-a-live-secret"
+    for name, value in (("NODE_OPTIONS", "--require=/tmp/attacker.cjs"), ("NODE_PATH", "/tmp/attacker-modules")):
+        os.environ[name] = value
+        real_run = bridge.subprocess.run
+        captured = {}
+        try:
+            def deny_collector(command, **kwargs):
+                captured["command"] = command
+                captured["environment"] = kwargs["env"]
+                return subprocess.CompletedProcess(command, 1, "", "test collector denied")
+            bridge.subprocess.run = deny_collector
+            try:
+                bridge.build_cycle({42: "test"}, evidence)
+            except bridge.BridgeError as error:
+                assert "live collector failed" in str(error)
+            else:
+                raise AssertionError("non-admitting collector seam produced a cycle")
+        finally:
+            bridge.subprocess.run = real_run
+        assert captured["command"][0] == str(bridge._trusted_node())
+        assert name not in captured["environment"]
+        assert "GITHUB_TOKEN" in captured["environment"]
+        os.environ.pop(name, None)
 finally:
-    bridge.subprocess.run = real_run
     if previous_token is None:
         os.environ.pop("GITHUB_TOKEN", None)
     else:
         os.environ["GITHUB_TOKEN"] = previous_token
-    if previous_test_mode is None:
-        os.environ.pop("SIXLAB_CI_COLLECTOR_TEST_MODE", None)
+    if previous_options is None:
+        os.environ.pop("NODE_OPTIONS", None)
     else:
-        os.environ["SIXLAB_CI_COLLECTOR_TEST_MODE"] = previous_test_mode
+        os.environ["NODE_OPTIONS"] = previous_options
+    if previous_path is None:
+        os.environ.pop("NODE_PATH", None)
+    else:
+        os.environ["NODE_PATH"] = previous_path
 
 print("SIXLABJITProjectManagerBridgeSmoke: PASS · fixture safe + production collector-only")

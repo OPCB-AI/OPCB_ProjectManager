@@ -1245,9 +1245,7 @@ def _canonical_input(path: Path, label: str) -> object:
         raise CollectorError(f"{label} is not valid JSON") from error
 
 
-def build_canonical_cycle(
-    selections: object, evidence_by_pull: object, canonical_collector: Path,
-) -> dict[str, Any]:
+def build_canonical_cycle(selections: object, evidence_by_pull: object) -> dict[str, Any]:
     """Bridge B's freshly collected correlation into the A-side v2 cycle.
 
     B itself enumerates every open PR and workflow immediately before this
@@ -1271,14 +1269,15 @@ def build_canonical_cycle(
     ):
         raise CollectorError("canonical bridge PR keys must be unique decimal integers")
     try:
-        return bridge.build_cycle(normalized_selections, normalized_evidence, canonical_collector)
+        return bridge.build_cycle(normalized_selections, normalized_evidence)
     except bridge.BridgeError as error:
         raise CollectorError(str(error)) from error
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bridge all-open-PR JIT correlation into a local v2 cycle")
-    parser.add_argument("--sixlab-live-collector", type=Path)
+    parser.add_argument("--sixlab-live-collector", type=Path,
+                        help="rejected compatibility-only external collector path")
     parser.add_argument("--selections", type=Path)
     parser.add_argument("--evidence", type=Path)
     # Compatibility-only: these values are rejected before any source read.
@@ -1295,14 +1294,13 @@ def main() -> int:
             arguments.history_file, arguments.terminal_job_id,
         )):
             raise CollectorError("legacy single-PR/single-run CLI is retired; it cannot create a schedulable admission")
-        if any(value is None for value in (
-            arguments.sixlab_live_collector, arguments.selections, arguments.evidence,
-        )):
-            raise CollectorError("digest-pinned SIXLAB live collector, selections, and evidence are required")
+        if arguments.sixlab_live_collector is not None:
+            raise CollectorError("caller-supplied SIXLAB collector path is forbidden; use the vendored provenance-pinned source")
+        if any(value is None for value in (arguments.selections, arguments.evidence)):
+            raise CollectorError("vendored SIXLAB collector selections and evidence are required")
         snapshot = build_canonical_cycle(
             _canonical_input(arguments.selections, "selections"),
             _canonical_input(arguments.evidence, "evidence"),
-            arguments.sixlab_live_collector,
         )
         if arguments.output is not None:
             _atomic_json(arguments.output, snapshot)

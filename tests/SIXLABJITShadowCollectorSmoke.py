@@ -579,7 +579,6 @@ with tempfile.TemporaryDirectory(prefix="sixlab-jit-collector.") as temporary:
         raise AssertionError("legacy single-run collector remained callable")
 
     correlation = json.loads((project / "tests" / "fixtures" / "sixlab-pr-runner-correlation-v2.json").read_text())
-    validator = Path(os.environ["SIXLAB_CI_CONTRACT_VALIDATOR"])
     bridge_host = {
         "observed_at": "2026-09-04T00:02:00Z", "global_lock_held": False,
         "active_services": [], "service_details": [], "dedicated_process_count": 0,
@@ -602,12 +601,12 @@ with tempfile.TemporaryDirectory(prefix="sixlab-jit-collector.") as temporary:
     # A correlation file can only exercise fixture validation; neither the
     # fixture nor the old CLI can make a schedulable production cycle.
     fixture_evidence = json.loads(evidence_path.read_text())
-    fixture = bridge.validate_test_fixture(correlation, {42: "test"}, {42: fixture_evidence["42"]}, validator)
+    fixture = bridge.validate_test_fixture(correlation, {42: "test"}, {42: fixture_evidence["42"]})
     assert fixture["status"] == "CHECK-INCOMPLETE"
     assert fixture["live_mutation_allowed"] is False
     assert fixture["token_allowed"] is False
     canonical = subprocess.run(
-        [sys.executable, str(source), "--sixlab-live-collector", str(validator), "--selections", str(selections_path),
+        [sys.executable, str(source), "--sixlab-live-collector", "/tmp/attacker-collector.mjs", "--selections", str(selections_path),
          "--evidence", str(evidence_path), "--output", str(cycle_output)],
         check=False, capture_output=True, text=True,
     )
@@ -615,7 +614,7 @@ with tempfile.TemporaryDirectory(prefix="sixlab-jit-collector.") as temporary:
     failed = json.loads(cycle_output.read_text())
     assert failed["status"] == "CHECK-INCOMPLETE"
     assert failed["live_mutation_allowed"] is False
-    assert "collector digest or path drifted" in failed["error"]
+    assert "caller-supplied SIXLAB collector path is forbidden" in failed["error"]
 
     collector._atomic_json(history, {
         "schema": collector.HISTORY_SCHEMA,

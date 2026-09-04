@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Collect and map a B-validated SIXLAB correlation into R1 shadow observations.
+"""Collect and map a vendored B correlation into R1 shadow observations.
 
-The source correlation has one latest run for every required workflow, while
-the R1 scheduler deliberately accepts one selected workflow run per open PR.
-The fixed, version-controlled B validator first proves the complete
-open-PR/workflow matrix and derives every allowed job family/instance count.
-Callers may select one of those already-validated workflows per PR, but cannot
-provide, reduce, replace, or inject the PR/run universe.  Production invokes
-B's digest-pinned live collector itself; a JSON correlation is never a
-production admission input.
+The production bridge executes only the exact bytes reviewed in SIXLAB PR
+#1201.  It supplies an empty-by-default Node environment, so neither callers
+nor an ambient shell can inject Node loaders, module paths, or inspectors.
 """
 
 from __future__ import annotations
@@ -27,9 +22,32 @@ import sixlab_jit_shadow_controller as shadow
 
 CORRELATION_SCHEMA = "sixlab-jit-pr-runner-correlation-v2"
 BRIDGE_SCHEMA = "sixlab-jit-open-pr-cycle-v1"
+SOURCE_REPOSITORY = "Steven-ZYH/sixlab"
+SOURCE_PULL_REQUEST = 1201
+SOURCE_HEAD = "1efdfd2d754822d29d4f0a4f93b48117a663116f"
+CANONICAL_MANIFEST_SHA256 = "9595d39c7ff80dce09cd33cf328efb0cf90d6709f14b32e51371df6e882ebc9e"
 CANONICAL_VALIDATOR_SHA256 = "70a8cdb5fea2d0a5a04fb896336041dce80dd8cdf51663115bc96d65114e3e31"
 CANONICAL_CONTRACT_SHA256 = "57a0fd3d88a344bab7b6174742b3a1b10f02f0fd16e582bff1fba99bd2d83d61"
 CANONICAL_COLLECTOR_SHA256 = "c3611524baf3e535ad4815898fa1c6cc791f777815e121674af280e3838cf021"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+VENDOR_ROOT = PROJECT_ROOT / "vendor" / "sixlab-pr1201"
+VENDOR_FILES = {
+    ".claude/ci-runner-automation-contract.v1.json": CANONICAL_CONTRACT_SHA256,
+    ".github/workflows/test-backend.yml": "233f8ecfa172361bc54d3c8c87ff0df5d0bf1d961fc23e54f6547631d2595ec8",
+    ".github/workflows/test.yml": "aee582274151a53c4b9ca27eee068f37fcc38b8dc460d1b09ad523daa644bd4a",
+    ".github/workflows/pr-peer-review-gate.yml": "7fed9a4e58a1d4c0cc665be804ac5071d3384ea02da08b3b9e36662b7c5ce7fc",
+    "scripts/ci/collect-pr-runner-correlation.mjs": CANONICAL_COLLECTOR_SHA256,
+    "scripts/ci/collect-pr-runner-correlation.test.mjs": "ba774eda78b020edf5a9189863f1f0529cc1cf80838a07b88178f9fe670b763f",
+    "scripts/ci/pr-runner-contract.mjs": CANONICAL_VALIDATOR_SHA256,
+}
+PROXY_AND_CA_ENV = (
+    "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "all_proxy", "http_proxy", "https_proxy", "no_proxy",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_DIR", "SSL_CERT_FILE",
+)
+TRUSTED_NODE_CANDIDATES = (
+    Path("/opt/homebrew/bin/node"), Path("/usr/local/bin/node"), Path("/usr/bin/node"),
+)
 
 
 class BridgeError(RuntimeError):
@@ -46,34 +64,56 @@ def _record(value: object, keys: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def _pinned_validator(validator: Path) -> Path:
-    if not isinstance(validator, Path):
-        raise BridgeError("canonical SIXLAB validator path is invalid")
+def _regular_bytes(path: Path, label: str) -> bytes:
     try:
-        metadata = validator.lstat()
-        raw = validator.read_bytes()
+        metadata = path.lstat()
+        raw = path.read_bytes()
     except OSError as error:
-        raise BridgeError("canonical SIXLAB validator is unreadable") from error
-    if validator.is_symlink() or not stat.S_ISREG(metadata.st_mode) or not raw:
-        raise BridgeError("canonical SIXLAB validator must be a regular non-symlink file")
-    if validator.name != "pr-runner-contract.mjs" or validator.parent.name != "ci":
-        raise BridgeError("canonical SIXLAB validator path is invalid")
-    contract = validator.parent.parent.parent / ".claude" / "ci-runner-automation-contract.v1.json"
+        raise BridgeError(f"{label} is unreadable") from error
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or not raw:
+        raise BridgeError(f"{label} must be a regular non-symlink file")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise BridgeError(f"{label} has unsafe write permissions")
+    return raw
+
+
+def _vendored_b() -> dict[str, Path]:
+    """Return only the path/digest/provenance-pinned B files in this repo."""
+    root = VENDOR_ROOT
+    manifest = root / "provenance.json"
+    manifest_raw = _regular_bytes(manifest, "vendored SIXLAB provenance manifest")
+    if _digest(manifest_raw) != CANONICAL_MANIFEST_SHA256:
+        raise BridgeError("vendored SIXLAB provenance manifest digest drifted")
     try:
-        contract_metadata = contract.lstat()
-        contract_raw = contract.read_bytes()
-    except OSError as error:
-        raise BridgeError("canonical SIXLAB contract is unreadable") from error
-    if (contract.is_symlink() or not stat.S_ISREG(contract_metadata.st_mode)
-            or _digest(raw) != CANONICAL_VALIDATOR_SHA256
-            or _digest(contract_raw) != CANONICAL_CONTRACT_SHA256):
-        raise BridgeError("canonical SIXLAB validator or contract digest drifted")
-    return validator
+        parsed = json.loads(manifest_raw)
+    except json.JSONDecodeError as error:
+        raise BridgeError("vendored SIXLAB provenance manifest is invalid JSON") from error
+    if parsed != {
+        "schema": "opcb-projectmanager-vendored-sixlab-pr1201-v1",
+        "source": {"repository": SOURCE_REPOSITORY, "pullRequest": SOURCE_PULL_REQUEST, "head": SOURCE_HEAD},
+        "files": VENDOR_FILES,
+    }:
+        raise BridgeError("vendored SIXLAB provenance manifest is not the reviewed source")
+    files: dict[str, Path] = {}
+    for relative, expected_digest in VENDOR_FILES.items():
+        path = root / relative
+        raw = _regular_bytes(path, f"vendored SIXLAB file {relative}")
+        if _digest(raw) != expected_digest:
+            raise BridgeError(f"vendored SIXLAB file digest drifted: {relative}")
+        files[relative] = path
+    return files
+
+
+def _pinned_validator() -> Path:
+    return _vendored_b()["scripts/ci/pr-runner-contract.mjs"]
 
 
 def _canonical_validation(correlation: object, validator: Path) -> dict[str, Any]:
     """Run B's fixed validator and retain only its contract-derived output."""
-    validator = _pinned_validator(validator)
+    pinned_validator = _pinned_validator()
+    if validator != pinned_validator:
+        raise BridgeError("canonical SIXLAB validator path is invalid")
+    validator = pinned_validator
     try:
         source = json.dumps(correlation, separators=(",", ":"), sort_keys=True)
     except (TypeError, ValueError) as error:
@@ -101,33 +141,51 @@ def _canonical_validation(correlation: object, validator: Path) -> dict[str, Any
     return result
 
 
-def _canonical_collector(collector: Path) -> Path:
-    """Return the only B collector a production bridge is allowed to execute."""
-    if not isinstance(collector, Path):
-        raise BridgeError("canonical SIXLAB collector path is invalid")
-    try:
-        metadata = collector.lstat()
-        raw = collector.read_bytes()
-    except OSError as error:
-        raise BridgeError("canonical SIXLAB collector is unreadable") from error
-    if (collector.is_symlink() or not stat.S_ISREG(metadata.st_mode)
-            or collector.name != "collect-pr-runner-correlation.mjs"
-            or collector.parent.name != "ci"
-            or _digest(raw) != CANONICAL_COLLECTOR_SHA256):
-        raise BridgeError("canonical SIXLAB collector digest or path drifted")
-    _pinned_validator(collector.parent / "pr-runner-contract.mjs")
-    return collector
+def _trusted_node() -> Path:
+    """Resolve a system Node binary without consulting PATH or shell state."""
+    for candidate in TRUSTED_NODE_CANDIDATES:
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.lstat()
+        except OSError:
+            continue
+        if (not stat.S_ISREG(metadata.st_mode)
+                or not (metadata.st_mode & stat.S_IXUSR)
+                or metadata.st_uid not in {0, os.geteuid()}
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            continue
+        return resolved
+    raise BridgeError("no trusted Node executable is available")
 
 
-def _collect_live_correlation(collector: Path) -> object:
-    """Run B's read-only GitHub collector; caller data cannot replace this."""
-    collector = _canonical_collector(collector)
-    if not os.environ.get("GITHUB_TOKEN"):
+def _collector_environment() -> dict[str, str]:
+    """Pass only collector inputs that cannot load code into Node."""
+    unsafe = [name for name in os.environ if (
+        name in {"LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH"}
+        or (name.startswith("NODE_") and name != "NODE_EXTRA_CA_CERTS")
+    )]
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
         raise BridgeError("canonical SIXLAB live collector requires GITHUB_TOKEN")
-    if any(name.startswith("SIXLAB_CI_COLLECTOR_TEST_") for name in os.environ):
-        raise BridgeError("test-only collector configuration cannot produce a live admission")
+    environment = {"GITHUB_TOKEN": token}
+    for name in PROXY_AND_CA_ENV:
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    # Deliberately do not inherit ``unsafe``.  Keeping this explicit scan makes
+    # new Node/dynamic-loader variables visible in review while preserving a
+    # bare local test command on hosts that set harmless Node telemetry values.
+    _ = unsafe
+    return environment
+
+
+def _collect_live_correlation() -> object:
+    """Run B's read-only GitHub collector; caller data cannot replace this."""
+    files = _vendored_b()
+    collector = files["scripts/ci/collect-pr-runner-correlation.mjs"]
+    node = _trusted_node()
     completed = subprocess.run(
-        ["node", str(collector), "--stdout"], capture_output=True, text=True, check=False,
+        [str(node), str(collector), "--stdout"], env=_collector_environment(),
+        capture_output=True, text=True, check=False,
     )
     if completed.returncode != 0:
         raise BridgeError("canonical SIXLAB live collector failed")
@@ -266,20 +324,18 @@ def _build_from_validated_correlation(
     return {"schema": BRIDGE_SCHEMA, "observed_at": source["observedAt"], "open_pull_numbers": sorted(pulls), "snapshots": snapshots}
 
 
-def build_cycle(selections: object, evidence_by_pull: object, canonical_collector: Path) -> dict[str, Any]:
+def build_cycle(selections: object, evidence_by_pull: object) -> dict[str, Any]:
     """Build a schedulable cycle from B's freshly collected live inventory."""
-    correlation = _collect_live_correlation(canonical_collector)
+    correlation = _collect_live_correlation()
     return _build_from_validated_correlation(
         correlation, selections, evidence_by_pull,
-        canonical_collector.parent / "pr-runner-contract.mjs",
+        _pinned_validator(),
     )
 
 
-def validate_test_fixture(
-    correlation: object, selections: object, evidence_by_pull: object, canonical_validator: Path,
-) -> dict[str, Any]:
+def validate_test_fixture(correlation: object, selections: object, evidence_by_pull: object) -> dict[str, Any]:
     """Validate a fixture without returning a cycle that scheduling can consume."""
-    _build_from_validated_correlation(correlation, selections, evidence_by_pull, canonical_validator)
+    _build_from_validated_correlation(correlation, selections, evidence_by_pull, _pinned_validator())
     return {
         "schema": "sixlab-jit-bridge-test-fixture-v1",
         "status": "CHECK-INCOMPLETE",

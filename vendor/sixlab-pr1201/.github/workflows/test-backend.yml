@@ -1,0 +1,340 @@
+# test-backend — backend 改动的 **PR 时** L1 单测 gate(红=真回归,挡合并)。
+#
+# 为什么存在(2026-06-24): backend unit-test 原在 test.yml(unit-backend job),2026-06-10 零-GH-计费
+# 迁移时被删,理由「与 deploy-backend gate 重复 + 本仓直 push main、PR 罕用」。但 2026-06-20 起
+# enforce_admins=true → 所有改动一律走 PR,「PR 罕用」前提失效 → backend PR 不再有任何测试 gate。
+# 实测后果: PR#89 一条陈旧 backend 单测带病 squash 进 main,失败只在 merge 后 deploy-backend 暴露,
+# 且 deploy step 依赖 unit-test → 一条陈旧测试卡死全队 backend→staging 部署
+# ([[feedback_backend_unit_test_not_gating_pr_stale_test_blocks_staging_deploy]])。
+#
+# ⚠️ always-runs 模式(2026-06-24 硬化为 required-ready):
+#   **不加 on.pull_request.paths 过滤** —— 本 workflow 要当 branch-protection 的 required check,
+#   必须在**每个** PR 都产出结论。若加 path 过滤,非-backend PR 不触发 → required check 永不上报 →
+#   PR 永远 pending(GitHub「required + path 过滤」经典死锁)。改用 job 内 `git diff` 探测:
+#     - 含 backend/database/shared 改动 → 跑 test:unit + test:migration;
+#     - 不含 → 跳过测试步骤,但 **job 仍 success(绿 check)** → 满足 required 不死锁。
+#   关键: 用**步骤级 if**(非 job 级)——job 级 if 会让整 job "skipped",而 skipped **不**满足
+#   required check(GitHub 要 success);步骤级 if 跳过后 job 仍 concludes success。
+#   相关性通过 GitHub changed-files API 判断，不为一次路径判断拉取完整 Git 历史。
+# deploy-backend.yml 仍在手动 staging 发布时跑完整 4 gate(build/integration/db-repo/unit)；
+# 本 workflow 在 PR 时跑最广的纯逻辑安全网 test:unit，并对 schema contract 加一条
+# docker-backed test:migration，避免迁移断言只在 merge 后才被发现。
+name: test-backend
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    branches: [main]
+    # 故意不加 paths(见上 always-runs 注释): 每个 PR 都跑,job 内 git diff 决定是否真跑测试。
+
+concurrency:
+  # Bind PR orchestration to the exact head. Older cancelled runs can retain
+  # queued job-level concurrency entries and must not block current-head job
+  # materialization. This workflow is PR-only.
+  group: test-backend-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # 所有 PR job 只请求单一 exact-only JIT label；不能同时请求 self-hosted/共享 label，
+  # 否则带 exact label 的 runner 仍可被 subset-compatible 旧 job 误领。
+  # 只有真 backend 变更才进重测试。
+  backend-detect:
+    runs-on:
+      - "${{ format('sixlab-pr-job-{0}-backend-detect', github.event.pull_request.head.sha) }}"
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+    steps:
+      - name: 探测是否含 backend gate 相关改动 (决定是否真跑 test:unit)
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          CHANGED=""
+          api_rc=1
+          fetch_changed_files() {
+            page=1
+            while [ "$page" -le 30 ]; do
+              payload="$(curl -fsSL --connect-timeout 5 --max-time 30 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100&page=$page")" || return $?
+              count="$(jq -r 'length' <<<"$payload")" || return $?
+              jq -r '.[].filename' <<<"$payload" || return $?
+              [ "$count" -lt 100 ] && return 0
+              page=$((page + 1))
+            done
+            return 75
+          }
+          if [ -n "$PR_NUMBER" ]; then
+            for attempt in 1 2 3; do
+              CHANGED="$(fetch_changed_files 2>/dev/null)"
+              api_rc=$?
+              if [ "$api_rc" -eq 0 ] && [ -n "$CHANGED" ]; then break; fi
+              echo "::warning::PR changed-files API 失败/为空 ($attempt/3, rc=$api_rc)"
+              [ "$attempt" -eq 3 ] || sleep $((attempt * 2))
+            done
+          fi
+          if [ "$api_rc" -ne 0 ] || [ -z "$PR_NUMBER" ] || [ -z "$CHANGED" ]; then
+            echo "PR changed-files API 有界重试后仍失败/为空 → fail-safe run=1"
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$CHANGED"
+          if printf '%s\n' "$CHANGED" | grep -qE '^((backend|database|shared|test-utils|infra/slidev-render|infra/deck-skill-runtime|packages/doc-canvas-codec|packages/slide-deck-v2|packages/deck-skills)/|\.deploy\.sh$|package(-lock)?\.json$|spa/package\.json$|infra/mcp-server/package\.json$|deploy/(cron/|nginx/staging\.paolab\.cn\.conf$|scripts/rum-p50-alert(\.test)?\.sh$|systemd/sixlab-(runtime-affinity-restore|rum-alert|runner-watchdog)\.(service|timer)$)|\.claude/(break-glass-rolling-gap\.test|rollback(-topology-behavior\.test)?)\.sh$|\.github/workflows/(test-backend|tls-expiry-probe)\.yml$|scripts/ops/check-tls-expiry(\.test)?\.mjs$|scripts/ci/(assert-runtime-closure-expectation|check-agent-descriptors|check-langchain-core-singleton|check-orchestration-boundary|doc-canvas-mcp-staging-nginx|retain-runtime-build|retain-runtime-before-cutover|prod-runtime-closure-drift-repair|runner-watchdog)(\.test)?\.sh$|scripts/ci/(ci-promote-backend-prod(-rolling-order\.test)?|deploy-backend-prod-(ghrunner|wrapper-authority\.test))\.sh$|scripts/ci/runtime-closure-manifest(\.test)?\.py$)'; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            echo "→ 含 backend gate 相关改动 → 跑 test:unit"
+          else
+            echo "run=0" >> "$GITHUB_OUTPUT"
+            echo "→ 无 backend 改动 → 跳过 heavy checkout/test:unit"
+          fi
+
+  # L1 全量单测 = backend 最广安全网(纯逻辑, 无 docker/DB)。
+  # 测试步骤镜像 deploy-backend.yml unit-test job。
+  backend-tests:
+    needs: backend-detect
+    if: needs.backend-detect.result == 'success' && needs.backend-detect.outputs.run == '1'
+    # Docker-backed PR tests must stay disposable. Absence of ephemeral capacity
+    # is a fail-closed queue, never a fallback to any persistent/nonprod/prod host.
+    runs-on:
+      - "${{ format('sixlab-pr-job-{0}-backend-tests', github.event.pull_request.head.sha) }}"
+    concurrency:
+      # PR tests use disposable capacity and must not share the persistent
+      # non-production host queue with trusted-main/deployment work.
+      group: ${{ format('sixlab-pr-untrusted-ephemeral-{0}-{1}-backend-tests', github.event.pull_request.number, github.event.pull_request.head.sha) }}
+      cancel-in-progress: false
+      queue: max
+    # 2026-07-21 实测慢链路 sparse checkout 约 5m48s，完整 unit 约 14min。
+    # 两次 checkout 的预算必须与 install/test 共存；20min 会在恢复路径尚未完成时误杀 job。
+    timeout-minutes: 50
+    steps:
+      - name: 等 github.com 可达 (跨境网络 flake 防御; 步骤名被 ci-retry.yml 归因匹配, 改名须同步)
+        run: |
+          for i in $(seq 1 24); do
+            # 探 checkout 真实走的路径:每轮重读 ghrunner gitconfig 的 proxy(Phase2 health timer 可能中途翻),
+            # 配了 HK 就经 HK(HEAD 轻量;max-time 10 bound 最坏),否则直连。否则 relay 在直连被阻断窗口反被直连探测挡死。
+            _PXY="$(git config --global --get http.https://github.com/.proxy 2>/dev/null || true)"
+            if [ -n "$_PXY" ]; then curl -sf -o /dev/null -I --connect-timeout 5 --max-time 10 --proxy "$_PXY" https://github.com/ && exit 0
+            else curl -sf -o /dev/null -I --connect-timeout 5 --max-time 10 https://github.com/ && exit 0; fi
+            # github.com 不可达 → 分离探 api.github.com，区分「整体断网」vs「github.com IP 选择性阻断但 api 活」
+            # (2026-06-25 事故特征态，最隐蔽：Runner.Listener 经 api 照常领任务，但 checkout/wait-gate 拉 github.com 全卡)
+            if curl -sf -o /dev/null --connect-timeout 2 --max-time 3 https://api.github.com/; then  # 观测探测用短超时,不让 gate 总时长撞 job timeout
+              if [ "${asym:-0}" = 0 ]; then echo "::warning::github.com 不可达但 api.github.com 可达 — 跨境 IP 选择性阻断特征态(2026-06-25 同型，pin-rotate 应自愈)"; asym=1; fi
+              echo "github.com 不可达 / api.github.com 可达 ($i/24，选择性阻断), 15s 后重试"; sleep 15
+            else
+              echo "github.com + api.github.com 均不可达 ($i/24，疑整体断网), 15s 后重试"; sleep 15
+            fi
+          done
+          echo "✗ github.com 持续 ~6min 不可达, fail-fast (恢复后 ci-retry 自动重跑或人工 rerun)"; exit 1
+      # 与 SPA gate 相同：commit fetch 成功后仍可能在 promisor blob 物化阶段遇到
+      # HTTP/2 early EOF / GnuTLS 瞬断。同 job 内有界重试一次，两次都失败才让 job 红。
+      - name: Run actions/checkout@v4 (attempt 1)
+        id: checkout_primary
+        continue-on-error: true
+        uses: actions/checkout@v4
+        timeout-minutes: 12
+        with:
+          # 单测只读当前 PR merge tree；无需抓取全部 branches/tags/history。
+          # 只物化 backend gate 真正依赖的约 18 MiB 源树，避免 SPA public
+          # 素材把 checkout 放大为一次百 MiB 级 promisor 请求。
+          fetch-depth: 1
+          fetch-tags: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /backend/
+            /database/
+            /shared/
+            /test-utils/
+            /scripts/ci/
+            /scripts/test-services-up.sh
+            /scripts/test-services-down.sh
+            /.claude/break-glass-rolling-gap.test.sh
+            /.claude/rollback.sh
+            /.claude/rollback-topology-behavior.test.sh
+            /.deploy.sh
+            /scripts/ops/check-tls-expiry.mjs
+            /scripts/ops/check-tls-expiry.test.mjs
+            /deploy/cron/
+            /deploy/docker-compose.test.yml
+            /deploy/nginx/staging.paolab.cn.conf
+            /deploy/scripts/rum-p50-alert.sh
+            /deploy/scripts/rum-p50-alert.test.sh
+            /deploy/systemd/sixlab-runtime-affinity-restore.service
+            /deploy/systemd/sixlab-rum-alert.service
+            /deploy/systemd/sixlab-rum-alert.timer
+            /deploy/systemd/sixlab-runner-watchdog.service
+            /deploy/systemd/sixlab-runner-watchdog.timer
+            /deploy/systemd/daily-integrity-timers.test.sh
+            /deploy/systemd/install-daily-integrity-timers.sh
+            /deploy/systemd/sixlab-backup-verify.service
+            /deploy/systemd/sixlab-backup-verify.timer
+            /deploy/systemd/sixlab-yjs-consistency.service
+            /deploy/systemd/sixlab-yjs-consistency.timer
+            /deploy/systemd/sixlab-yjs-backup.service
+            /deploy/systemd/sixlab-yjs-backup.timer
+            /.github/workflows/promote-backend-prod.yml
+            /.github/workflows/tls-expiry-probe.yml
+            /infra/mcp-server/package.json
+            /infra/slidev-render/
+            /infra/deck-skill-runtime/
+            /packages/doc-canvas-codec/
+            /packages/slide-deck-v2/
+            /packages/deck-skills/
+            /spa/package.json
+            /package.json
+            /package-lock.json
+      - name: Run actions/checkout@v4 (attempt 2 after transport failure)
+        id: checkout_retry
+        if: steps.checkout_primary.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 12
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /backend/
+            /database/
+            /shared/
+            /test-utils/
+            /scripts/ci/
+            /scripts/test-services-up.sh
+            /scripts/test-services-down.sh
+            /.claude/break-glass-rolling-gap.test.sh
+            /.claude/rollback.sh
+            /.claude/rollback-topology-behavior.test.sh
+            /.deploy.sh
+            /scripts/ops/check-tls-expiry.mjs
+            /scripts/ops/check-tls-expiry.test.mjs
+            /deploy/cron/
+            /deploy/docker-compose.test.yml
+            /deploy/nginx/staging.paolab.cn.conf
+            /deploy/scripts/rum-p50-alert.sh
+            /deploy/scripts/rum-p50-alert.test.sh
+            /deploy/systemd/sixlab-runtime-affinity-restore.service
+            /deploy/systemd/sixlab-rum-alert.service
+            /deploy/systemd/sixlab-rum-alert.timer
+            /deploy/systemd/sixlab-runner-watchdog.service
+            /deploy/systemd/sixlab-runner-watchdog.timer
+            /deploy/systemd/daily-integrity-timers.test.sh
+            /deploy/systemd/install-daily-integrity-timers.sh
+            /deploy/systemd/sixlab-backup-verify.service
+            /deploy/systemd/sixlab-backup-verify.timer
+            /deploy/systemd/sixlab-yjs-consistency.service
+            /deploy/systemd/sixlab-yjs-consistency.timer
+            /deploy/systemd/sixlab-yjs-backup.service
+            /deploy/systemd/sixlab-yjs-backup.timer
+            /.github/workflows/promote-backend-prod.yml
+            /.github/workflows/tls-expiry-probe.yml
+            /infra/mcp-server/package.json
+            /infra/slidev-render/
+            /infra/deck-skill-runtime/
+            /packages/doc-canvas-codec/
+            /packages/slide-deck-v2/
+            /packages/deck-skills/
+            /spa/package.json
+            /package.json
+            /package-lock.json
+      - name: assert checkout recovered
+        id: checkout
+        if: steps.checkout_primary.outcome == 'success' || steps.checkout_retry.outcome == 'success'
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f infra/slidev-render/worker.test.mjs
+          test -f packages/doc-canvas-codec/src/index.ts
+          test -f deploy/nginx/staging.paolab.cn.conf
+      - name: assert system node (ECS 系统 node, 免 setup-node 走 GH CDN)
+        run: |
+          node -v && npm -v
+          node -e 'const M=Number(process.version.slice(1).split(".")[0]); if(M<20){console.error("✗ node <20");process.exit(1)}'
+      # npm install(非 npm ci): 在 linux 上重新解析平台 optional deps(拉 @img/sharp-linux-x64);
+      # npm ci 严格跟随 Mac 生成的 lockfile → 不拉 linux 二进制 → sharp collect 期崩。
+      - name: npm install
+        run: nice -n 10 npm install --no-audit --no-fund
+      # 兜底: 显式确保 sharp linux-x64 glibc 二进制在场(ECS Ubuntu=glibc); lockfile 跨平台已知 npm 坑。
+      - name: ensure sharp linux-x64 binary (cross-platform lockfile workaround)
+        run: npm install --no-save --include=optional --os=linux --cpu=x64 --libc=glibc sharp -w backend
+      - name: backend L1 全量单测 (test:unit, 无 docker — 红=真回归挡合并)
+        run: nice -n 10 npm run -w backend test:unit
+      - name: Phase 1 schema contract (docker MySQL — 迁移断言必须在 PR 前执行)
+        run: |
+          set -euo pipefail
+          eval "$(VITEST_POOL_ID=pr-migration bash scripts/test-services-up.sh)"
+          trap 'bash scripts/test-services-down.sh || true' EXIT
+          nice -n 10 npm run -w backend test:migration
+      - name: Doc Canvas MCP staging nginx discovery guard
+        run: bash scripts/ci/doc-canvas-mcp-staging-nginx.test.sh
+      - name: Slidev worker 协议与 fail-closed 回归
+        run: nice -n 10 node --test infra/slidev-render/worker.test.mjs
+      - name: '@langchain/core 单实例护栏 (hoist 防炸)'
+        run: bash scripts/ci/check-langchain-core-singleton.sh package-lock.json
+      - name: 编排层边界守卫 (禁 checkpointer / 禁 node 内联扣费 — 架构漂移 CI 锁)
+        # Phase 2 块1: orchestration 层永无状态作者层, durability+exactly-once 唯一真相源在
+        # SIXLAB 持久化(非 LangGraph checkpointer)。守卫不变式见 engine.types.ts 顶注。
+        run: bash scripts/ci/check-orchestration-boundary.sh
+      - name: agent descriptor grep guard (P4 防 if/else 门控回潮)
+        run: bash scripts/ci/check-agent-descriptors.sh
+      - name: runtime affinity closure + cutover/reboot retention guards
+        run: |
+          python3 scripts/ci/runtime-closure-manifest.test.py
+          bash scripts/ci/retain-runtime-build.test.sh
+          bash scripts/ci/retain-runtime-before-cutover.test.sh
+          bash scripts/ci/prod-runtime-closure-drift-repair.test.sh
+      - name: production rolling restart topology guard
+        run: |
+          bash scripts/ci/ci-promote-backend-prod-rolling-order.test.sh
+          bash scripts/ci/deploy-backend-prod-wrapper-authority.test.sh
+          bash scripts/ci/runner-watchdog.test.sh
+          bash .claude/break-glass-rolling-gap.test.sh
+          bash .claude/rollback-topology-behavior.test.sh
+      - name: backup verify-only + cron + TLS expiry guards
+        run: |
+          node --test scripts/ci/check-secret-literal-fallbacks.test.mjs
+          node scripts/ci/check-secret-literal-fallbacks.mjs
+          bash backend/scripts/backup.test.sh
+          bash backend/scripts/backup-restore.test.sh
+          bash deploy/cron/cron-paths.test.sh
+          bash deploy/systemd/daily-integrity-timers.test.sh
+          bash deploy/scripts/rum-p50-alert.test.sh
+          node --test scripts/ops/check-tls-expiry.test.mjs
+          grep -Fq "if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)" \
+            .github/workflows/tls-expiry-probe.yml
+          ! grep -Eq '(^|[[:space:]])gh[[:space:]]+issue' .github/workflows/tls-expiry-probe.yml
+          grep -Fq 'github_api GET' .github/workflows/tls-expiry-probe.yml
+          grep -Fq '$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues' .github/workflows/tls-expiry-probe.yml
+
+  # Branch protection 仍只看 backend-unit；该 ephemeral aggregator 对无关 PR
+  # 秒级放行，对相关 PR 则 fail-closed 折叠真实 heavy 测试结果。
+  backend-unit:
+    name: backend-unit
+    needs: [backend-detect, backend-tests]
+    if: always()
+    runs-on:
+      - "${{ format('sixlab-pr-job-{0}-backend-unit', github.event.pull_request.head.sha) }}"
+    timeout-minutes: 5
+    steps:
+      - name: required backend gate 判定
+        env:
+          DETECT_RESULT: ${{ needs.backend-detect.result }}
+          RUN_BACKEND: ${{ needs.backend-detect.outputs.run }}
+          TEST_RESULT: ${{ needs.backend-tests.result }}
+        run: |
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "✗ backend detect 未成功 ($DETECT_RESULT)"; exit 1
+          fi
+          if [ "$RUN_BACKEND" = "0" ]; then
+            echo "→ 无 backend 相关改动，required gate 秒级放行"; exit 0
+          fi
+          if [ "$RUN_BACKEND" != "1" ]; then
+            echo "✗ backend detect 输出非法 ($RUN_BACKEND)"; exit 1
+          fi
+          if [ "$TEST_RESULT" = "success" ]; then
+            echo "→ backend L1 测试通过"; exit 0
+          fi
+          echo "✗ backend L1 测试未通过 ($TEST_RESULT)"; exit 1
