@@ -50,7 +50,7 @@ os.environ.update({
     "SSL_CERT_FILE": "/tmp/attacker-cert.pem",
 })
 
-real_run = bridge.subprocess.run
+real_run = bridge._run_bounded_process
 calls = []
 
 
@@ -60,10 +60,10 @@ def fake_run(command, **kwargs):
 
 
 try:
-    bridge.subprocess.run = fake_run
+    bridge._run_bounded_process = fake_run
     # A GitHub-side 503 is represented by B's nonzero collector exit, and
     # cannot cause a retry or a partially parsed cycle.
-    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(collector)], 1, "", "HTTP 503")]
+    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(collector)], 1, b"", b"HTTP 503")]
     try:
         bridge._collect_live_correlation(test_node)
     except bridge.BridgeError as error:
@@ -73,8 +73,13 @@ try:
     command, kwargs = calls.pop()
     assert command == [str(test_node), str(collector), "--stdout"]
     assert kwargs["env"] == {"GITHUB_TOKEN": "test-token-not-a-live-secret"}
+    assert kwargs["input_bytes"] is None
+    assert kwargs["timeout_seconds"] == bridge.COLLECTOR_TIMEOUT_SECONDS
+    assert kwargs["stdout_limit_bytes"] == bridge.COLLECTOR_STDOUT_LIMIT_BYTES
+    assert kwargs["stderr_limit_bytes"] == bridge.COLLECTOR_STDERR_LIMIT_BYTES
+    assert kwargs["label"] == "canonical SIXLAB live collector"
 
-    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(collector)], 0, "not-json", "")]
+    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(collector)], 0, b"not-json", b"")]
     try:
         bridge._collect_live_correlation(test_node)
     except bridge.BridgeError as error:
@@ -82,7 +87,7 @@ try:
     else:
         raise AssertionError("bad collector JSON was accepted")
 
-    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(validator)], 1, "", "invalid")]
+    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(validator)], 1, b"", b"invalid")]
     try:
         bridge._canonical_validation({}, validator, test_node)
     except bridge.BridgeError as error:
@@ -92,17 +97,36 @@ try:
     command, kwargs = calls.pop()
     assert command == [str(test_node), str(validator), "--validate-snapshot-stdin"]
     assert kwargs["env"] == {}
-    assert "test-token-not-a-live-secret" not in kwargs["input"]
+    assert b"test-token-not-a-live-secret" not in kwargs["input_bytes"]
+    assert kwargs["timeout_seconds"] == bridge.VALIDATOR_TIMEOUT_SECONDS
+    assert kwargs["stdout_limit_bytes"] == bridge.VALIDATOR_STDOUT_LIMIT_BYTES
+    assert kwargs["stderr_limit_bytes"] == bridge.VALIDATOR_STDERR_LIMIT_BYTES
+    assert kwargs["label"] == "canonical SIXLAB validator"
 
-    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(validator)], 0, "not-json", "")]
+    fake_run.responses = [subprocess.CompletedProcess([str(test_node), str(validator)], 0, b"not-json", b"")]
     try:
         bridge._canonical_validation({}, validator, test_node)
     except bridge.BridgeError as error:
         assert str(error) == "canonical SIXLAB validator returned invalid JSON"
     else:
         raise AssertionError("bad validator JSON was accepted")
+
+    # Validator input is rejected before a process can start; the collector's
+    # larger runtime budget does not leak into this separate local boundary.
+    original_input_limit = bridge.VALIDATOR_INPUT_LIMIT_BYTES
+    bridge.VALIDATOR_INPUT_LIMIT_BYTES = 1
+    call_count = len(calls)
+    try:
+        bridge._canonical_validation({}, validator, test_node)
+    except bridge.BridgeError as error:
+        assert str(error) == "canonical SIXLAB validator input exceeds byte limit"
+    else:
+        raise AssertionError("oversized validator input started a process")
+    finally:
+        bridge.VALIDATOR_INPUT_LIMIT_BYTES = original_input_limit
+    assert len(calls) == call_count
 finally:
-    bridge.subprocess.run = real_run
+    bridge._run_bounded_process = real_run
     for name, value in previous.items():
         if value is None:
             os.environ.pop(name, None)

@@ -14,8 +14,12 @@ import hashlib
 import json
 import os
 import re
+import select
+import selectors
+import signal
 import stat
 import subprocess
+import time
 
 import sixlab_jit_shadow_controller as shadow
 
@@ -50,10 +54,66 @@ NODE_TRUST_SCHEMA = "opcb-sixlab-jit-node-trust-v2"
 # vendor here, but the bridge never executes the checkout copy in production.
 INSTALLED_VENDOR_ROOT = Path("/var/lib/opcb/sixlab-jit/vendor/sixlab-pr1201")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+COLLECTOR_TIMEOUT_SECONDS = 120.0
+COLLECTOR_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+COLLECTOR_STDERR_LIMIT_BYTES = 256 * 1024
+VALIDATOR_TIMEOUT_SECONDS = 15.0
+VALIDATOR_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
+VALIDATOR_STDOUT_LIMIT_BYTES = 8 * 1024 * 1024
+VALIDATOR_STDERR_LIMIT_BYTES = 256 * 1024
+PROCESS_REAP_TIMEOUT_SECONDS = 1.0
+PROCESS_IO_CHUNK_BYTES = 64 * 1024
+PROCESS_EXIT_POLL_SECONDS = 0.05
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+class _LeaderExitWatch:
+    """Observe leader exit without reaping it, preserving its PID/PGID."""
+
+    def __init__(self, pid: int) -> None:
+        self._pidfd: int | None = None
+        self._pidfd_selector: selectors.BaseSelector | None = None
+        self._kqueue: Any = None
+        try:
+            if hasattr(os, "pidfd_open"):
+                self._pidfd = os.pidfd_open(pid)
+                self._pidfd_selector = selectors.DefaultSelector()
+                self._pidfd_selector.register(self._pidfd, selectors.EVENT_READ)
+            elif hasattr(select, "kqueue"):
+                self._kqueue = select.kqueue()
+                event = select.kevent(
+                    pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                self._kqueue.control([event], 0, 0)
+            else:
+                raise BridgeError("bounded subprocess exit observation is unsupported")
+        except Exception:
+            self.close()
+            raise
+
+    def has_exited(self) -> bool:
+        if self._pidfd is not None:
+            assert self._pidfd_selector is not None
+            return bool(self._pidfd_selector.select(0))
+        assert self._kqueue is not None
+        return bool(self._kqueue.control(None, 1, 0))
+
+    def close(self) -> None:
+        if self._pidfd_selector is not None:
+            self._pidfd_selector.close()
+            self._pidfd_selector = None
+        if self._pidfd is not None:
+            os.close(self._pidfd)
+            self._pidfd = None
+        if self._kqueue is not None:
+            self._kqueue.close()
+            self._kqueue = None
 
 
 class _VerifiedFile:
@@ -155,6 +215,140 @@ def _fixture_pinned_validator() -> Path:
     return _vendored_b()["scripts/ci/pr-runner-contract.mjs"]
 
 
+def _close_stream(stream: Any, selector: selectors.BaseSelector | None = None) -> None:
+    if stream is None:
+        return
+    if selector is not None:
+        try:
+            selector.unregister(stream)
+        except (KeyError, ValueError):
+            pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes], label: str) -> None:
+    """Kill the isolated child group and reap its leader within a fixed bound."""
+    # There is no graceful grace period after the operation deadline: the
+    # collector may hold a credential and a descendant may retain a pipe.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # macOS may report EPERM when only an unreaped orphan remains.  The
+        # leader is still our direct child and must never survive cleanup.
+        if process.poll() is None:
+            process.kill()
+    try:
+        process.wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError(f"{label} cleanup timed out") from error
+
+
+def _run_bounded_process(
+    command: list[str], *, input_bytes: bytes | None, env: dict[str, str],
+    timeout_seconds: float, stdout_limit_bytes: int, stderr_limit_bytes: int,
+    label: str,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one isolated process with a hard deadline and bounded pipe reads."""
+    if timeout_seconds <= 0 or stdout_limit_bytes < 0 or stderr_limit_bytes < 0:
+        raise BridgeError(f"{label} process limits are invalid")
+    deadline = time.monotonic() + timeout_seconds
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+        bufsize=0,
+    )
+    exit_watch: _LeaderExitWatch | None = None
+    selector: selectors.BaseSelector | None = None
+    stdout = bytearray()
+    stderr = bytearray()
+    cleanup_started = False
+    try:
+        try:
+            exit_watch = _LeaderExitWatch(process.pid)
+            selector = selectors.DefaultSelector()
+        except BridgeError:
+            raise
+        except Exception as error:
+            raise BridgeError(f"{label} process setup failed") from error
+        assert process.stdout is not None and process.stderr is not None
+        for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        if process.stdin is not None:
+            if input_bytes:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
+                _close_stream(process.stdin)
+
+        input_offset = 0
+        leader_exited = False
+        while not leader_exited or selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BridgeError(f"{label} timed out")
+            if not leader_exited and exit_watch.has_exited():
+                # Observe exit without waitpid first.  The unreaped leader keeps
+                # its PID/PGID stable while every remaining group member is
+                # killed; only then may the leader be reaped.
+                cleanup_started = True
+                _terminate_process_group(process, label)
+                leader_exited = True
+                continue
+            events = selector.select(min(remaining, PROCESS_EXIT_POLL_SECONDS))
+            for key, _ in events:
+                stream = key.fileobj
+                name = key.data
+                if name == "stdin":
+                    assert process.stdin is not None and input_bytes is not None
+                    try:
+                        written = os.write(process.stdin.fileno(), input_bytes[input_offset:])
+                    except BrokenPipeError:
+                        written = 0
+                        input_offset = len(input_bytes)
+                    else:
+                        input_offset += written
+                    if input_offset == len(input_bytes):
+                        _close_stream(process.stdin, selector)
+                    continue
+
+                target = stdout if name == "stdout" else stderr
+                limit = stdout_limit_bytes if name == "stdout" else stderr_limit_bytes
+                allowance = limit - len(target)
+                try:
+                    chunk = os.read(stream.fileno(), min(PROCESS_IO_CHUNK_BYTES, allowance + 1))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    _close_stream(stream, selector)
+                    continue
+                if len(chunk) > allowance:
+                    raise BridgeError(f"{label} {name} exceeds byte limit")
+                target.extend(chunk)
+
+        assert process.returncode is not None
+        return subprocess.CompletedProcess(command, process.returncode, bytes(stdout), bytes(stderr))
+    finally:
+        if selector is not None:
+            selector.close()
+        if exit_watch is not None:
+            exit_watch.close()
+        _close_stream(process.stdin)
+        _close_stream(process.stdout)
+        _close_stream(process.stderr)
+        if not cleanup_started:
+            _terminate_process_group(process, label)
+
+
 def _canonical_validation(
     correlation: object, validator: Path, node: Path, *, expected_validator: Path | None = None,
 ) -> dict[str, Any]:
@@ -164,24 +358,27 @@ def _canonical_validation(
         raise BridgeError("canonical SIXLAB validator path is invalid")
     validator = pinned_validator
     try:
-        source = json.dumps(correlation, separators=(",", ":"), sort_keys=True)
+        source = json.dumps(correlation, separators=(",", ":"), sort_keys=True).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise BridgeError("correlation cannot be encoded for canonical validation") from error
-    completed = subprocess.run(
+    if len(source) > VALIDATOR_INPUT_LIMIT_BYTES:
+        raise BridgeError("canonical SIXLAB validator input exceeds byte limit")
+    completed = _run_bounded_process(
         [str(node), str(validator), "--validate-snapshot-stdin"],
-        input=source,
-        capture_output=True,
-        text=True,
+        input_bytes=source,
         # Validator input is untrusted correlation JSON.  It has no need for a
         # credential, PATH, Node flags/module paths, proxy, or CA settings.
         env={},
-        check=False,
+        timeout_seconds=VALIDATOR_TIMEOUT_SECONDS,
+        stdout_limit_bytes=VALIDATOR_STDOUT_LIMIT_BYTES,
+        stderr_limit_bytes=VALIDATOR_STDERR_LIMIT_BYTES,
+        label="canonical SIXLAB validator",
     )
     if completed.returncode != 0:
         raise BridgeError("canonical SIXLAB contract rejected correlation")
     try:
-        result = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
+        result = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BridgeError("canonical SIXLAB validator returned invalid JSON") from error
     _record(result, {"schemaVersion", "repository", "openPullRequests", "selectedRuns"}, "canonical SIXLAB validation")
     if result["schemaVersion"] != 2 or result["repository"] != shadow.EXPECTED_REPOSITORY:
@@ -379,17 +576,20 @@ def _collect_live_correlation(node: Path, installed_vendor: _InstalledVendor | N
         if installed_vendor is not None
         else _vendored_b()["scripts/ci/collect-pr-runner-correlation.mjs"]
     )
-    completed = subprocess.run(
-        [str(node), str(collector), "--stdout"], env=_collector_environment(),
-        capture_output=True, text=True, check=False,
+    completed = _run_bounded_process(
+        [str(node), str(collector), "--stdout"],
+        input_bytes=None,
+        env=_collector_environment(),
+        timeout_seconds=COLLECTOR_TIMEOUT_SECONDS,
+        stdout_limit_bytes=COLLECTOR_STDOUT_LIMIT_BYTES,
+        stderr_limit_bytes=COLLECTOR_STDERR_LIMIT_BYTES,
+        label="canonical SIXLAB live collector",
     )
     if completed.returncode != 0:
         raise BridgeError("canonical SIXLAB live collector failed")
-    if len(completed.stdout.encode("utf-8")) > 8 * 1024 * 1024:
-        raise BridgeError("canonical SIXLAB live collector output exceeds byte limit")
     try:
-        correlation = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
+        correlation = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BridgeError("canonical SIXLAB live collector returned invalid JSON") from error
     _record(correlation, {"schema", "observedAt", "repository", "openPullRequests", "runs"}, "live correlation")
     return correlation

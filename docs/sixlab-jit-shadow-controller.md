@@ -166,6 +166,24 @@ evidence. Any head SHA, base SHA/ref, state, draft flag or PR identity drift
 during collection rejects the snapshot. The current-head run enumeration must
 contain exactly one target-PR run for each fixed `test` and `test-backend`
 workflow profile; its sorted run-ID set is embedded in every snapshot.
+
+The ProjectManager bridge executes the provenance-pinned SIXLAB collector and
+validator through an isolated process group with bounded, incremental pipe
+reads. The live collector has a 120-second wall-clock deadline, an 8 MiB stdout
+limit, and a 256 KiB stderr limit. The local validator has a separate 15-second
+deadline, 8 MiB input and stdout limits, and a 256 KiB stderr limit. Timeout or
+the first over-limit byte fails closed and immediately sends `SIGKILL` to the
+entire isolated process group; its leader then has a separate, enforced
+one-second reap deadline. This bounds both cleanup and the lifetime of the
+collector's short-lived GitHub token when a descendant stalls or retains a
+pipe. Neither boundary waits for an unbounded `capture_output` buffer before
+enforcing its limits. A zero or nonzero leader exit also terminates any
+remaining member of the isolated group before the leader is reaped, including
+a descendant that deliberately closed all inherited pipes. Pipe EOF alone is
+not treated as process completion: the bridge observes the leader's actual exit
+without reaping it, terminates the still-stable group, and only then reaps the
+leader and preserves its zero or nonzero status.
+
 Read failures identify only the safe evidence layer (`pull`, `run`, `jobs`,
 Runner inventory, or host probe) and never echo stderr, command payloads, key
 paths, tokens, or process arguments. Every relative `gh api` request is pinned
