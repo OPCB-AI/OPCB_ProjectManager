@@ -204,7 +204,8 @@ def _terminals(correlation):
                 raise TrustedCycleError('an existing job allocation forbids new admission')
             if job['status'] != 'completed':
                 continue
-            if job['runner_id'] is None and job['runner_name'] is None and job['conclusion'] == 'skipped':
+            if (job['runner_id'] is None and job['runner_name'] is None and
+                    job['conclusion'] in {'cancelled', 'skipped', 'stale'}):
                 continue
             allocation = collector._job_allocation(job, pull_number=row['pullRequestNumber'],
                 run_id=row['run']['id'], attempt=row['run']['attempt'], run_head=row['run']['headSha'])

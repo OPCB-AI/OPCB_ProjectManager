@@ -38,7 +38,8 @@ class Clock:
     def sleep(self, delay): self.seconds += delay
 
 
-def exercise(attack=None, terminal=False, public=False):
+def exercise(attack=None, terminal=False, public=False, conclusion='success', unbound=False,
+             partial_binding=False):
     clock = Clock()
     trusted.time = clock
     trusted._utc = lambda: BASE + timedelta(seconds=clock.seconds)
@@ -46,7 +47,11 @@ def exercise(attack=None, terminal=False, public=False):
     state = copy.deepcopy(fixture)
     if terminal:
         j = state['runs'][0]['jobs'][0]
-        j.update(status='completed', conclusion='success', runnerId=777, runnerName='sixlab-pr42-aaaaar2-01')
+        j.update(status='completed', conclusion=conclusion,
+            runnerId=None if unbound else 777,
+            runnerName=None if unbound else 'sixlab-pr42-aaaaar2-01')
+        if partial_binding:
+            j['runnerId'] = None
     def correlation(node, vendor, **kw):
         nonlocal correlations
         correlations += 1
@@ -103,6 +108,7 @@ def exercise(attack=None, terminal=False, public=False):
             'swap_free_bytes': 1024**3, 'receipt_file': None}
         if attack == 'host-drift' and probes == 2: result['global_lock_held'] = True
         if command[-1] != '-':
+            assert not unbound, 'unbound terminal requested a receipt'
             raw = ('slot=01 runner=sixlab-pr42-aaaaar2-01 expected_head=' + 'a'*40 +
                 ' label=sixlab-pr-job-' + 'a'*40 + '-spa-detect exit=0 finished=2026-09-04T00:02:00+00:00')
             if attack == 'receipt-binding': raw = raw.replace('slot=01', 'slot=07')
@@ -135,13 +141,26 @@ def exercise(attack=None, terminal=False, public=False):
             except trusted.TrustedCycleError: pass
             else: raise AssertionError('saved evidence retained admission validity')
     assert correlations == 3 and inventories == 2
+    assert probes == (4 if terminal and not unbound else 2), probes
     return calls
 
 
 try:
     exercise()
     exercise(terminal=True)
+    for conclusion in ('cancelled', 'skipped', 'stale'):
+        exercise(terminal=True, conclusion=conclusion, unbound=True)
+        exercise(terminal=True, conclusion=conclusion)
+        try: exercise('receipt-binding', terminal=True, conclusion=conclusion)
+        except (trusted.TrustedCycleError, bridge.BridgeError, trusted.collector.CollectorError): pass
+        else: raise AssertionError('bound terminal bypassed receipt validation: ' + conclusion)
     exercise(public=True)
+    for conclusion, unbound in (('success', True), ('failure', True),
+                               ('cancelled', False), ('stale', False)):
+        try: exercise(terminal=True, conclusion=conclusion, unbound=unbound,
+                      partial_binding=not unbound)
+        except (trusted.TrustedCycleError, bridge.BridgeError, trusted.collector.CollectorError): pass
+        else: raise AssertionError('invalid unbound/partial terminal allocation accepted')
     for attack in ('old-host', 'future-host', 'old-github', 'head-drift', 'closing-drift',
                    'unselected-active', 'orphan', 'runner-drift', 'duplicate-runner',
                    'host-drift', 'deadline', 'stale-final', 'receipt-binding'):
