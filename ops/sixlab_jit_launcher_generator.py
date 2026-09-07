@@ -15,12 +15,12 @@ from typing import Any
 
 
 TEMPLATE_NAME = "pr1173-one-job-launcher-fcca0r1.sh"
-TEMPLATE_SHA256 = "4b369ac5414843c649885d86b425f73eafe42e67c77c22486190b594ba385ba6"
+TEMPLATE_SHA256 = "84d2019e978ca54212cacbd2c1cbd5e279ff7bdee14880d9ead5edff0423f826"
 SOURCE_PULL_NUMBER = 1173
 SOURCE_HEAD = "fcca0a92d8882f01b8e203f6ed661358882c5339"
 SOURCE_ATTEMPT = 1
 SOURCE_PREFIX = "fcca0r1"
-SOURCE_LAUNCHER_PREFIX = "fcca0-r1-usproxy5"
+SOURCE_LAUNCHER_PREFIX = "fcca0-r1-usproxy5-scopefd1-exitmemv5"
 SOURCE_SLOT = "07"
 SOURCE_FAMILY = "spa-checks"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -81,7 +81,7 @@ def _read_template() -> str:
         "flock -n 9",
         "--ephemeral --disableupdate --no-default-labels --unattended",
         "--run) [[ $# == 2 ]]",
-        "systemd-run --user --scope --quiet --pipe",
+        'systemd-run --user --scope --quiet --unit="$scope_unit" --property=Delegate=yes',
         "IFS= read -r token",
         "--proxy-canary) [[ $# == 1 ]]",
         '[[ "${1:-}" == "$ALLOWED_SLOT" ]]',
@@ -109,6 +109,16 @@ def _read_template() -> str:
         "receipt path already exists; archive explicitly before run",
         "os.O_WRONLY | os.O_CREAT | os.O_EXCL",
         "exclusive receipt creation failed",
+        "evidence path already exists; archive explicitly before run",
+        "sixlab-jit-launcher-evidence-v5",
+        "sixlab-jit-scope-memory-evidence-v5",
+        "SIXLAB_SCOPE_MEMORY_COLLECTOR_BEGIN",
+        "RUNNER_MANUALLY_TRAP_SIG=1 ./run.sh",
+        '--unit="$scope_unit"',
+        "scope memory evidence unavailable or stale",
+        "runner_listener_not_observed",
+        "expected_runner_identity",
+        "copied Runner.Listener identity invalid",
         "stop_dedicated_runtime()",
         "egress fence retained: dedicated runtime remains",
         'pkill -KILL -u "$USER_ID"',
@@ -128,6 +138,10 @@ def _read_template() -> str:
     )
     if any(item not in text for item in required):
         raise GeneratorError("launcher template safety contract drifted")
+    if any(option in text for option in ("--pipe", "--pty", "--wait", "--no-block")):
+        raise GeneratorError("launcher template combines scope mode with incompatible systemd-run stdio or wait options")
+    if text.count("systemd-run --user --scope") != 1 or text.count("IFS= read -r token") != 1:
+        raise GeneratorError("launcher template scope or single-read stdin contract drifted")
     if "amazonaws.com" in text or "blob.core.windows.net" in text:
         raise GeneratorError("launcher template contains a tenant-controlled cloud suffix")
     if any(forbidden in text for forbidden in ("--stage-token", "--stage-existing-token", "token_path", "token_file", "registration-token", ".token")):
@@ -155,7 +169,7 @@ def render(
         raise GeneratorError("slot is not allowed")
     family = SLOT_FAMILIES[slot]
     prefix = f"{expected_head[:5]}r{attempt}"
-    launcher_prefix = f"{expected_head[:5]}-r{attempt}-usproxy5"
+    launcher_prefix = f"{expected_head[:5]}-r{attempt}-usproxy5-scopefd1-exitmemv5"
     text = _read_template()
     replacements = (
         (f"readonly PULL_NUMBER='{SOURCE_PULL_NUMBER}'", f"readonly PULL_NUMBER='{pull_number}'"),
@@ -206,6 +220,11 @@ def render(
         "source_sha256": TEMPLATE_SHA256,
         "rendered_sha256": _digest(raw),
         "capability_scope": "single-slot-single-family",
+        "execution_evidence_profile": "runner-exit-scope-memory-v5",
+        "legacy_receipt_schema": "sixlab-jit-teardown-receipt-v1",
+        "sidecar_evidence_schema": "sixlab-jit-launcher-evidence-v5",
+        "scope_memory_schema": "sixlab-jit-scope-memory-evidence-v5",
+        "sidecar_consumer_activation": "not-authorized",
         "installation_authorized": False,
         "token_mint_authorized": False,
     }

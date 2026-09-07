@@ -110,6 +110,45 @@ latest attempts, resource gates, missing service detection, terminal receipt
 binding, offline Runner residue, unknown-field rejection, and symlinked input
 rejection.
 
+The reviewed launcher generator now emits the
+`runner-exit-scope-memory-v5` execution-evidence profile. It selects the
+Actions Runner `RUNNER_MANUALLY_TRAP_SIG` path so a non-zero `run.sh` status is
+not converted to zero by the default wrapper. The launcher preserves the
+legacy, immutable six-field `sixlab-jit-teardown-receipt-v1` line for current
+collector compatibility and writes a separate immutable
+`sixlab-jit-launcher-evidence-v5` JSON sidecar. The sidecar records runner,
+controller, teardown, and telemetry-cleanup states separately. A controller
+exit is never relabeled as a Runner exit: listener observation is recorded with
+an unknown Runner exit code unless an independent Runner-exit source is added.
+Telemetry freshness is independently revalidated against the finalizer's UTC
+publication clock, so teardown elapsed time is included and a sample older
+than two seconds becomes `unknown/stale_sample`. The finalizer repeats this
+check after both immutable files have been staged and fsynced, immediately
+before linking the evidence/receipt commit pair, so slow staging also fails
+closed. All
+telemetry transient cleanup completes before the immutable receipt/sidecar pair
+is published. A teardown failure is exit 70 only
+when no earlier non-zero runner/controller/signal status exists; missing or
+stale scope evidence similarly produces exit 75 only when the execution status
+was otherwise zero. This preserves the first abnormal execution status while
+still making auxiliary-evidence failures non-zero.
+
+The bounded root-side sampler keeps only its latest validated snapshot and
+reads no environment, command line, token, full log, or core. It binds an
+explicit `.scope` unit to UID 1005 and a bounded PID inventory. Before the
+scope starts, the controller records the device/inode identity of the copied
+`Runner.Listener`; only a `/proc/<pid>/exe` matching that exact executable
+identity counts as listener observation. A scope that never exposes that
+verified listener becomes `unknown/runner_listener_not_observed` and cannot
+produce a zero evidence exit. The collector also rejects
+symlinked or out-of-root cgroup paths, and allows only scalar fields from
+`memory.current`, `memory.peak`, `memory.events`, `memory.events.local`, and
+`memory.pressure`. Missing, stale, malformed, ambiguously bound, or oversized
+evidence is recorded as `unknown`; it is never interpreted as proof that an
+OOM did or did not occur. Existing shadow collector/controller code does not
+ingest this sidecar, so installing it or activating a new consumer remains a
+separate reviewed and explicitly authorized change.
+
 `ops/sixlab_jit_shadow_collector.py` is the matching read-only collector. It
 uses fixed GitHub `pull`, `run`, `jobs`, current-head run-inventory, and
 Runner-inventory GET endpoints plus a fixed Python probe sent to the Tencent
@@ -185,14 +224,19 @@ source/rendered digests and the exact job label. Both `installation_authorized` 
 service, token, or installer capability; host installation remains a separate
 reviewed and authorized operation.
 
-The current local review artifact is bound to PR #1198 head
-`5589cd6e417f101244eee0b0c7f56477ff36e2a1`, attempt 1, slot 07,
-`spa-checks`. Its launcher and manifest live under
-`artifacts/jit-candidates/pr1198/`; the manifest binds exact label
-`sixlab-pr-job-5589cd6e417f101244eee0b0c7f56477ff36e2a1-spa-checks` and rendered
-SHA-256 `9a0ccd27df990e6c98446bc544f0c08d5b3992b6103ce8c049bf5f447b62b133`.
+The current local review artifact is bound to PR #1201 head
+`fe4c0c3be00a4ad264eadf6dd44ec1cf9e5f0668`, attempt 1, slot 03,
+`spa-tests`. Its versioned `exitmemv5` launcher and manifest live under
+`artifacts/jit-candidates/pr1201/`; earlier `exitmemv1` through `exitmemv4`
+candidates remain immutable historical review artifacts. The v5 manifest binds exact label
+`sixlab-pr-job-fe4c0c3be00a4ad264eadf6dd44ec1cf9e5f0668-spa-tests` and rendered
+SHA-256 `1661b270bf7fc576403e74a8e4ac85837b08564ae4947eeb76b8181b50fcf3ac`.
 This is review evidence only and grants no host installation, token mint, or
 Runner start authority.
+
+The PR #1198 `us-proxy-v5` launcher remains only as a historical regression
+fixture under `artifacts/jit-candidates/pr1198/`, with rendered SHA-256 `9a0ccd27df990e6c98446bc544f0c08d5b3992b6103ce8c049bf5f447b62b133`;
+it is not the current review artifact.
 
 The `us-proxy-v5` candidate supersedes `us-proxy-v4` without changing or
 overwriting the installed v4 launcher. It keeps the canonical
@@ -233,11 +277,13 @@ before removing network controls. It escalates TERM to KILL with bounded
 readback; unless the manager is inactive and the UID process set is empty, the
 egress fence remains installed and teardown fails closed.
 Admission rejects every pre-existing dedicated UID process, not only a named
-Runner worker. The token is copied into the UID-readable job path only after
-the nftables/iptables fence and proxy/DNS canaries are active, followed by a
-second zero-process check immediately before token exposure.
-Exit 70 is reserved for any cleanup/readback failure and overwrites the job
-exit status. The evaluator refuses to classify that receipt as teardown
+Runner worker. After the nftables/iptables fence, proxy/DNS canaries, and a
+second zero-process check are complete, the scoped payload reads exactly one
+token line from controller stdin. It never stages the token in a job-path file
+and unsets the shell variable immediately after Runner configuration.
+Exit 70 is reserved for a cleanup/readback failure only when no earlier
+non-zero job, controller, signal, or evidence status exists. The evaluator
+refuses to classify that receipt as teardown
 verified, even if a later manual action removes the observed residue.
 The collector independently reads both nftables and iptables residue. A canary
 PASS is still not job-start authority. Active-state verification reads each
