@@ -1,0 +1,31 @@
+{
+  "schema": "sixlab-jit-pr-runner-correlation-v2",
+  "observedAt": "2026-09-04T00:02:00Z",
+  "repository": "Steven-ZYH/sixlab",
+  "openPullRequests": [
+    { "number": 42, "state": "open", "draft": false, "baseRef": "main", "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+  ],
+  "runs": [
+    {
+      "pullRequestNumber": 42,
+      "workflow": "test",
+      "run": { "id": 101, "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "attempt": 2, "latestAttempt": 2, "status": "queued" },
+      "jobs": [
+        { "id": 1001, "runId": 101, "runAttempt": 2, "name": "spa-detect", "family": "spa-detect", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-spa-detect"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:00Z" },
+        { "id": 1002, "runId": 101, "runAttempt": 2, "name": "spa-tests (1)", "family": "spa-tests", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-spa-tests"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:01Z" },
+        { "id": 1003, "runId": 101, "runAttempt": 2, "name": "spa-tests (2)", "family": "spa-tests", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-spa-tests"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:02Z" },
+        { "id": 1004, "runId": 101, "runAttempt": 2, "name": "spa-checks", "family": "spa-checks", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-spa-checks"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:03Z" }
+      ]
+    },
+    {
+      "pullRequestNumber": 42,
+      "workflow": "test-backend",
+      "run": { "id": 102, "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "attempt": 2, "latestAttempt": 2, "status": "queued" },
+      "jobs": [
+        { "id": 2001, "runId": 102, "runAttempt": 2, "name": "backend-detect", "family": "backend-detect", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-backend-detect"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:00Z" },
+        { "id": 2002, "runId": 102, "runAttempt": 2, "name": "backend-tests", "family": "backend-tests", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-backend-tests"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:01Z" },
+        { "id": 2003, "runId": 102, "runAttempt": 2, "name": "backend-unit", "family": "backend-unit", "status": "queued", "conclusion": null, "labels": ["sixlab-pr-job-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-backend-unit"], "runnerId": null, "runnerName": null, "createdAt": "2026-09-04T00:01:02Z" }
+      ]
+    }
+  ]
+}

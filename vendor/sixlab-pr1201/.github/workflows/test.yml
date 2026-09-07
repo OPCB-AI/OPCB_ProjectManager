@@ -1,0 +1,395 @@
+# test — push main / PR 的测试信号；`spa-checks` 是目标 required context。
+# 当前私有免费仓无法启用 branch protection，真实 peer 门见 pr-peer-review-gate + deploy fail-closed。
+#
+# C2(2026-06-25 · 调研定稿)：单 spa-checks job 拆成 **detect/tests/gate 三 job**，把「always-run 哨兵壳」
+#   从重 runner 挪到 light runner，非 spa PR 不再占重 runner slot。调研(§〇)把 C2 定为「辅助」(头号杠杆=D 缓存)，
+#   但低风险高收益顺手做。spa-tests 暂留 [self-hosted, sixlab-ecs]，Phase B1 再随别的 test job 翻 sixlab-heavy。
+#   plan: docs/superpowers/plans/2026-06-25-ci-runner-throughput-implementation.md (Task A.1 / §〇 / B1)
+#
+# ✅ 关键设计：**gate job 仍叫 `spa-checks`(不改名)** → required check context 不变 →
+#   **不动分支保护、不触发「PR 改了自己的 required check 名→自死锁」**(比 plan 初版的 spa→spa-gate 改名更安全)。
+#   strict:true(miaopantao #124)是独立一次性 admin 动作(PATCH required_status_checks 加 strict)，与本 PR 解耦。
+#
+# 三 job 结构(为什么)：required check 必须永远 success。
+#   - spa-detect(light)：push paths / PR changed-files API 判 spa 相关性，出 outputs.relevant。无需 checkout。
+#   - spa-tests(heavy)：needs spa-detect + if(relevant 或 detect 没干净成功 fail-safe)。无关 PR → skipped(不占重 runner=C2 收益)。
+#   - spa-checks(light, **保留名=required check**)：needs [spa-detect, spa-tests] + if: always()。
+#     按 needs.*.result 判定：非 spa PR 放行 / spa PR 随 spa-tests。always() → 永远报告 → 不死锁。
+#
+# 历史背景(保留)：2026-06-24 分支保护原本零 required check → #86/#87 带 biome 违规进 main → baseline 漂移
+#   → #96/#97 假红。根治 = required check 锁死 PR。GitHub 坑：required + on.paths 过滤 → 不碰 spa 的 PR
+#   永远 waiting-for-status。故 PR 触发不加 paths 过滤(每 PR 必跑)，相关性检测放 job 内(detect)。
+#   push:main 仍保留 paths 过滤(非 required, 仅 post-merge 信号, 成本敏感)。
+# 2026-06-10 全迁 self-hosted(零 GH 计费; 系统 node v22; npm npmmirror; nice -n 10 让位 prod backend)。
+name: test
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    branches: [main]
+    # ⚠️ 故意不加 paths 过滤(2026-06-24): required check 必须每 PR 都报告状态,
+    #    否则不碰 spa 的 PR 会因 job 不触发而「waiting for status」卡死。相关性检测移到 spa-detect。
+  push:
+    branches: [main]
+    paths:                      # push 非 required, 仅 post-merge 信号 → 保留 paths 过滤省 runner
+      - 'spa/**'
+      - 'shared/**'
+      - 'packages/doc-canvas-codec/**'
+      - 'test-utils/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.deploy.sh'
+      - '.claude/ci-runner-automation-contract.v1.json'
+      - '.github/CODEOWNERS'
+      - 'docs/CONTRIBUTING.md'
+      - '.github/workflows/test.yml'
+      - '.github/workflows/ci-retry.yml'
+      - '.github/workflows/deploy-spa.yml'
+      - '.github/workflows/promote-spa-prod.yml'
+      - '.github/workflows/canary-backend.yml'
+      - '.github/workflows/preview-spa.yml'
+      - '.github/workflows/pr-peer-review-gate.yml'
+      - 'scripts/ci/biome-ratchet.sh'
+      - 'scripts/ci/biome-ratchet.test.sh'
+      - 'scripts/ci/audit-review-duty-repo-access.sh'
+      - 'scripts/ci/audit-review-duty-repo-access.test.sh'
+      - 'scripts/ci/checkout-weight-guard.test.sh'
+      - 'scripts/ci/pr-runner-contract.mjs'
+      - 'scripts/ci/pr-runner-contract.test.mjs'
+      - 'scripts/ci/collect-pr-runner-correlation.mjs'
+      - 'scripts/ci/collect-pr-runner-correlation.test.mjs'
+      - 'scripts/ci/fixtures/pr-runner-correlation-v2.json'
+      - 'scripts/ci/source-pr-ephemeral-routing.test.mjs'
+      - 'scripts/ci/deploy-peer-review-bootstrap.test.sh'
+      - 'scripts/ci/canary-deploy-approval.mjs'
+      - 'scripts/ci/canary-deploy-approval.test.mjs'
+      - 'scripts/ci/cf-preview-standalone.test.sh'
+      - 'scripts/ci/deploy-backend-canary-ghrunner.sh'
+      - 'scripts/ci/deploy-backend-canary-ghrunner.test.sh'
+      - 'scripts/ci/materialize-spa-build-tree.sh'
+      - 'scripts/ci/materialize-spa-build-tree.test.sh'
+      - 'scripts/ci/opcb-promote-workflow-guard.test.sh'
+      - 'scripts/ci/spa-artifact.sh'
+      - 'scripts/ci/spa-artifact.test.sh'
+      - 'scripts/ci/sync-opcb-release-ref-api.sh'
+      - 'scripts/ci/tree-path-size.sh'
+      - 'scripts/ci/tree-path-size.test.sh'
+      - 'scripts/ci/verify-merged-spa-snapshot.sh'
+      - 'scripts/ci/verify-merged-spa-snapshot.test.sh'
+      - 'scripts/ci/verify-peer-approval.mjs'
+      - 'scripts/ci/verify-peer-approval.test.mjs'
+      - 'scripts/ci/verify-peer-approval-epochs.mjs'
+      - 'scripts/ci/verify-peer-approval-epochs.test.mjs'
+      - 'scripts/ci/pr-peer-review-bootstrap.test.sh'
+      - 'scripts/ci/repository-rename-compat.test.sh'
+      - 'scripts/ci/setup-runner-cpu-isolation.sh'
+      - 'scripts/ci/setup-runner-cpu-isolation.test.sh'
+      - 'scripts/ci/ci-retry-policy.test.sh'
+
+concurrency:
+  # A cancelled older PR run can retain queued job-level concurrency entries.
+  # Bind PR orchestration to the exact head so a stale run cannot prevent the
+  # current head from materializing its job IDs. Keep push:main unchanged.
+  group: test-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── detect: PR 只请求 exact-only JIT label；exact push:main 保留既有 light/nonprod 路由 ──
+  spa-detect:
+    runs-on: >-
+      ${{
+        github.event_name == 'pull_request' && fromJSON(format('["sixlab-pr-job-{0}-spa-detect"]', github.event.pull_request.head.sha)) ||
+        github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","sixlab-ecs-light","sixlab-ecs-nonprod-light"]') ||
+        fromJSON('["sixlab-pr-job-invalid"]')
+      }}
+    timeout-minutes: 20
+    outputs:
+      relevant: ${{ steps.detect.outputs.relevant }}
+    steps:
+      # ── always-run 哨兵: 检测本 PR/push 是否触及 spa 相关路径(与上方 push.paths 清单逐字对齐) ──
+      # push 已被 on.push.paths 筛过，必然 relevant；PR 直接通过 GitHub API 取 changed files，
+      # 不再为一个 name-only 判定 checkout 全仓。API 异常 fail-safe relevant=true。
+      - name: detect spa-relevant changes
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "push 已命中 workflow paths → relevant=true"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=""
+          api_rc=1
+          fetch_changed_files() {
+            page=1
+            while [ "$page" -le 30 ]; do
+              payload="$(curl -fsSL --connect-timeout 5 --max-time 30 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100&page=$page")" || return $?
+              count="$(jq -r 'length' <<<"$payload")" || return $?
+              jq -r '.[].filename' <<<"$payload" || return $?
+              [ "$count" -lt 100 ] && return 0
+              page=$((page + 1))
+            done
+            return 75
+          }
+          if [ -n "$PR_NUMBER" ]; then
+            for attempt in 1 2 3; do
+              CHANGED="$(fetch_changed_files 2>/dev/null)"
+              api_rc=$?
+              if [ "$api_rc" -eq 0 ] && [ -n "$CHANGED" ]; then break; fi
+              echo "::warning::PR changed-files API 失败/为空 ($attempt/3, rc=$api_rc)"
+              [ "$attempt" -eq 3 ] || sleep $((attempt * 2))
+            done
+          fi
+          if [ "$api_rc" -ne 0 ] || [ -z "$PR_NUMBER" ] || [ -z "$CHANGED" ]; then
+            echo "PR changed-files API 有界重试后仍失败/为空 → fail-safe relevant=true"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "$CHANGED"
+          if printf '%s\n' "$CHANGED" | grep -qE '^(spa/|shared/|packages/doc-canvas-codec/|test-utils/|infra/ci-control-prototype/|package(-lock)?\.json$|\.deploy\.sh$|\.claude/ci-runner-automation-contract\.v1\.json$|\.github/CODEOWNERS$|docs/CONTRIBUTING\.md$|\.github/workflows/(test|canary-backend|deploy-backend|deploy-spa|promote-spa-prod|preview-spa|pr-peer-review-gate|pr-peer-review-signal)\.yml$|scripts/ci/(audit-review-duty-repo-access(\.test)?\.sh|biome-ratchet(\.test)?\.sh|canary-deploy-approval(\.test)?\.mjs|cf-preview-standalone\.test\.sh|checkout-weight-guard\.test\.sh|deploy-backend-canary-ghrunner(\.test)?\.sh|deploy-peer-review-bootstrap\.test\.sh|fixtures/pr-runner-correlation-v2\.json|materialize-spa-build-tree(\.test)?\.sh|opcb-promote-workflow-guard\.test\.sh|pr-peer-review-bootstrap\.test\.sh|pr-runner-contract(\.test)?\.mjs|repository-rename-compat\.test\.sh|setup-runner-cpu-isolation(\.test)?\.sh|source-pr-ephemeral-routing\.test\.mjs|spa-artifact(\.test)?\.sh|sync-opcb-release-ref-api\.sh|tree-path-size(\.test)?\.sh|verify-merged-spa-snapshot(\.test)?\.sh|verify-peer-approval(-epochs)?(\.test)?\.mjs)$)'; then
+            echo "→ spa-relevant: 跑真 gate"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ 无 spa 相关改动: pass-through (spa-tests skip, spa-checks gate 放行)"
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── tests: 真 gate，重活 → 重 runner。无关 PR skip(不占重 runner=C2 收益) ──
+  # fail-safe: detect 没干净成功(网络 flake/异常) → 也跑(宁可多跑一次不漏真 gate)。
+  # ⚠️ DRAFT 待验证: ci-retry 用 rerun-failed-jobs(只重跑 failed)；若 detect 失败致 spa-tests SKIPPED,
+  #   rerun 不会重跑 skipped 的 spa-tests → 可能卡死。故这里 `result != 'success'` 让 detect 失败时
+  #   spa-tests 直接 run(非 skip)，绕开该坑。需在实施 PR 上真跑一遍 detect-failure 场景验证。
+  spa-tests:
+    needs: spa-detect
+    if: always() && (needs.spa-detect.outputs.relevant == 'true' || needs.spa-detect.result != 'success')
+    # PR 候选只请求单一 exact-only JIT label；不能同时请求 self-hosted/共享 label，
+    # 否则带 exact label 的 runner 仍可被 subset-compatible 旧 job 误领。
+    # 只有 exact push:main 保留既有 heavy/nonprod 路由。
+    runs-on: >-
+      ${{
+        github.event_name == 'pull_request' && fromJSON(format('["sixlab-pr-job-{0}-spa-tests"]', github.event.pull_request.head.sha)) ||
+        github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","sixlab-heavy","sixlab-ecs-nonprod-light"]') ||
+        fromJSON('["sixlab-pr-job-invalid"]')
+      }}
+    concurrency:
+      # PR work runs on the isolated ephemeral pool, so it must not inherit the
+      # persistent non-production host queue. The exact-head key also prevents
+      # stale jobs from an earlier PR head from blocking the current candidate.
+      group: ${{ github.event_name == 'pull_request' && format('sixlab-pr-untrusted-ephemeral-{0}-{1}-spa-tests-{2}', github.event.pull_request.number, github.event.pull_request.head.sha, matrix.shard) || 'nonprod-host-heavy' }}
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 50                  # chunked materialize 最坏 35min 后仍给 install/test 留有界余量
+    # shard 2 片（2026-07-16 CI 慢巡检）: profiling 证明无病态慢文件（443 文件测试本体仅 ~51s，
+    # 最慢 5.3s），CI 6min19s 是 443 个 jsdom 文件 × per-file env/transform 开销摊在 4 核 nice
+    # runner 上的结构成本很高；此 exact-only runner contract 故意让两个 shard 串行，
+    # 避免同一 exact label 的两个 candidate-controlled job 被并发分配到不确定容量。
+    # 附属 gate（callsite-lint/ratchet/typecheck，共 ~11s）只在 shard 1 跑一次。
+    strategy:
+      fail-fast: false          # 一片红不掐另一片: spa-checks 要聚合两片真实结果
+      max-parallel: 1           # contract: two SPA shards are deliberately serial
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: 等 github.com 可达 (跨境网络 flake 防御; 步骤名被 ci-retry.yml 归因匹配, 改名须同步)
+        run: |
+          for i in $(seq 1 24); do
+            # 探 checkout 真实走的路径:每轮重读 ghrunner gitconfig 的 proxy(Phase2 health timer 可能中途翻),
+            # 配了 HK 就经 HK(HEAD 轻量;max-time 10 bound 最坏),否则直连。否则 relay 在直连被阻断窗口反被直连探测挡死。
+            _PXY="$(git config --global --get http.https://github.com/.proxy 2>/dev/null || true)"
+            if [ -n "$_PXY" ]; then curl -sf -o /dev/null -I --connect-timeout 5 --max-time 10 --proxy "$_PXY" https://github.com/ && exit 0
+            else curl -sf -o /dev/null -I --connect-timeout 5 --max-time 10 https://github.com/ && exit 0; fi
+            # github.com 不可达 → 分离探 api.github.com，区分「整体断网」vs「github.com IP 选择性阻断但 api 活」
+            # (2026-06-25 事故特征态，最隐蔽：Runner.Listener 经 api 照常领任务，但 checkout/wait-gate 拉 github.com 全卡)
+            if curl -sf -o /dev/null --connect-timeout 2 --max-time 3 https://api.github.com/; then  # 观测探测用短超时,不让 gate 总时长撞 job timeout
+              if [ "${asym:-0}" = 0 ]; then echo "::warning::github.com 不可达但 api.github.com 可达 — 跨境 IP 选择性阻断特征态(2026-06-25 同型，pin-rotate 应自愈)"; asym=1; fi
+              echo "github.com 不可达 / api.github.com 可达 ($i/24，选择性阻断), 15s 后重试"; sleep 15
+            else
+              echo "github.com + api.github.com 均不可达 ($i/24，疑整体断网), 15s 后重试"; sleep 15
+            fi
+          done
+          echo "✗ github.com 持续 ~6min 不可达, fail-fast (恢复后 ci-retry 自动重跑或人工 rerun)"; exit 1
+      # checkout 只先拉 scripts/ci 小控制面；再与 deploy/preview 共用分块
+      # materializer。避免 `/*` 把当前树绑成一个约 106 MiB 的 promisor
+      # pack，early EOF 后无法复用任何部分进度。步骤名保留
+      # `Run actions/checkout` 前缀，供 ci-retry.yml 基础设施归因。
+      # A cancelled prior self-hosted job can race runner cleanup with the next
+      # checkout and remove its runner-file-command output after Git has already
+      # succeeded. Treat that control-file race like backend checkout transport
+      # flakes: retry once, then fail closed.
+      - name: Run actions/checkout@v4 (scripts-only control plane, attempt 1)
+        id: checkout_primary
+        continue-on-error: true
+        env:
+          # PR-only command-scope config reaches checkout's first Git child.
+          # count=0 preserves the existing trusted push:main transport.
+          GIT_CONFIG_COUNT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+        uses: actions/checkout@v4
+        timeout-minutes: 8
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/ci/
+      - name: Run actions/checkout@v4 (scripts-only control plane, attempt 2 after runner/transport failure)
+        if: steps.checkout_primary.outcome == 'failure'
+        env:
+          GIT_CONFIG_COUNT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+        uses: actions/checkout@v4
+        timeout-minutes: 8
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/ci/
+      - name: materialize SPA test tree in persistent chunks
+        timeout-minutes: 35
+        env:
+          # Unit tests and static gates consume source/config only. Public media is
+          # build input for deploy/preview and can exceed a cold cross-border run.
+          MATERIALIZE_INCLUDE_PUBLIC_ASSETS: "0"
+          # Materialization runs Git after checkout; keep the PR transport fix
+          # scoped to this network step while trusted push:main keeps defaults.
+          GIT_CONFIG_COUNT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+        run: bash scripts/ci/materialize-spa-build-tree.sh
+      - name: assert checkout and materialization complete
+        id: checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f .deploy.sh
+          test -f packages/doc-canvas-codec/src/index.ts
+          test -f spa/package.json
+          test -f test-utils/package.json
+      - name: assert system node (ECS 系统 node, 免 setup-node 走 GH CDN)
+        run: |
+          node -v && npm -v
+          node -e 'const M=Number(process.version.slice(1).split(".")[0]); if(M<20){console.error("✗ node <20");process.exit(1)}'
+      - name: npm install
+        id: deps
+        run: |
+          # Keep trusted push:main on its existing npm defaults. PR registry
+          # recovery stays inside npm's idempotent fetch layer and the job budget.
+          npm_cache_args=()
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            export NPM_CONFIG_FETCH_RETRIES=5
+            export NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=10000
+            export NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=60000
+            export NPM_CONFIG_FETCH_TIMEOUT=300000
+            npm_cache_args+=(--prefer-offline)
+          fi
+          nice -n 10 npm install --no-audit --no-fund "${npm_cache_args[@]}"
+      # 兜底: 显式确保 biome linux-x64 二进制在场 — root lockfile 是 macOS 生成的 degenerate
+      # lock(只含 darwin 变体), npm install 在 linux 重解析 optional deps 不可靠(npm/cli#4828)。
+      - name: ensure biome linux-x64 binary (CI cross-platform workaround)
+        run: npm install --no-save --include=optional --os=linux --cpu=x64 --libc=glibc @biomejs/biome -w spa
+      # 2026-08-19: 秒级静态闸放到 vitest 前面。biome / runner-label 失败时默认
+      # success() 会跳过后面 20min 单测，避免再为 import 顺序空转一轮 heavy。
+      # 两个 shard 串行执行；附属 gate 仍只在 shard 1 跑一次。
+      - name: runner label isolation regression test
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' }}
+        run: node scripts/ci/runner-label-isolation.test.mjs
+      - name: source PR ephemeral-only routing contract
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' }}
+        run: node scripts/ci/source-pr-ephemeral-routing.test.mjs
+      - name: ProjectManager CI runner correlation contract
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' }}
+        run: node --test scripts/ci/pr-runner-contract.test.mjs scripts/ci/collect-pr-runner-correlation.test.mjs
+      - name: trusted local CI intent contract regression test
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' }}
+        run: node --test infra/ci-control-prototype/src/*.test.mjs
+      - name: checkout weight guard (防全量大媒体回归)
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/checkout-weight-guard.test.sh
+      - name: spa biome ratchet (violations 只减不增)
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' && steps.deps.outcome == 'success' }}
+        env:
+          BIOME_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+        run: nice -n 10 bash scripts/ci/biome-ratchet.sh
+      - name: biome ratchet fail-closed regression test
+        if: ${{ matrix.shard == 1 && steps.checkout.outcome == 'success' && steps.deps.outcome == 'success' }}
+        run: bash scripts/ci/biome-ratchet.test.sh
+      - name: spa 单测 (真 gate — 红 = 真回归; shard ${{ matrix.shard }}/2)
+        run: nice -n 10 npm run -w spa test -- --shard=${{ matrix.shard }}/2
+      # 2026-06-18: 下列 gate 步骤加 if:!cancelled() — vitest 失败不再短路掉它们(防 biome 债在红色期潜伏)。
+      # 2026-07-16: 附属 gate 与 shard 无关(全量静态检查), 只在 shard 1 跑一次防双跑。
+      - name: deploy.sh call-site lint (真 gate)
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.deps.outcome == 'success' && matrix.shard == 1 }}
+        run: nice -n 10 npm run -w test-utils test -- deploy-sh-callsite-lint
+      - name: peer approval gate regression test
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        run: |
+          node --test scripts/ci/verify-peer-approval.test.mjs
+          node --test scripts/ci/verify-peer-approval-epochs.test.mjs
+          node --test scripts/ci/canary-deploy-approval.test.mjs
+          bash scripts/ci/deploy-backend-canary-ghrunner.test.sh
+          bash scripts/ci/pr-peer-review-bootstrap.test.sh
+          bash scripts/ci/deploy-peer-review-bootstrap.test.sh
+          bash scripts/ci/repository-rename-compat.test.sh
+          bash scripts/ci/audit-review-duty-repo-access.test.sh
+          bash scripts/ci/opcb-promote-workflow-guard.test.sh
+          bash scripts/ci/cf-preview-standalone.test.sh
+          bash scripts/ci/spa-artifact.test.sh
+      - name: test-utils typecheck (informational)
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.deps.outcome == 'success' && matrix.shard == 1 }}
+        run: npm run -w test-utils typecheck || true
+      - name: tree path size metadata regression test
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        run: bash scripts/ci/tree-path-size.test.sh
+      - name: prod runner resource isolation regression test
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        run: bash scripts/ci/setup-runner-cpu-isolation.test.sh
+      - name: CI retry mixed-failure fail-closed policy
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        run: bash scripts/ci/ci-retry-policy.test.sh
+      - name: sparse SPA materialization recovery test
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+        run: bash scripts/ci/materialize-spa-build-tree.test.sh
+      - name: squash-merged SPA snapshot gate regression test
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && matrix.shard == 1 }}
+        run: bash scripts/ci/verify-merged-spa-snapshot.test.sh
+
+  # ── gate: required status check(**保留名 spa-checks**，不改名→不动分支保护)。always() 永远报告 → 不死锁 ──
+  spa-checks:
+    needs: [spa-detect, spa-tests]
+    if: always()
+    runs-on: >-
+      ${{
+        github.event_name == 'pull_request' && fromJSON(format('["sixlab-pr-job-{0}-spa-checks"]', github.event.pull_request.head.sha)) ||
+        github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","sixlab-ecs-light","sixlab-ecs-nonprod-light"]') ||
+        fromJSON('["sixlab-pr-job-invalid"]')
+      }}
+    timeout-minutes: 5
+    steps:
+      - name: required gate 判定（无关 PR 放行 / 相关 PR 随 spa-tests）
+        run: |
+          rel='${{ needs.spa-detect.outputs.relevant }}'
+          res='${{ needs.spa-tests.result }}'
+          echo "relevant=$rel spa-tests.result=$res"
+          # spa-detect 自己挂了(网络/异常) → relevant 空 → fail-safe 当相关，要求 spa-tests 成功
+          if [ "$rel" != "true" ] && [ -n "$rel" ]; then echo "→ 非 spa PR，放行"; exit 0; fi
+          [ "$res" = "success" ] && { echo "→ spa 测试通过"; exit 0; }
+          echo "✗ spa 测试未通过 / detect 异常 (relevant=$rel result=$res)"; exit 1

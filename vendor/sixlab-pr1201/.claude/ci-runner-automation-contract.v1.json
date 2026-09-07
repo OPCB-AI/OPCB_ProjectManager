@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "repository": "Steven-ZYH/sixlab",
+  "purpose": "Local, fail-closed contract for ProjectManager CI Runner correlation. Runtime facts are supplied as a snapshot; this file never asserts a live GitHub state.",
+  "snapshotProtocol": {
+    "requiredFields": ["schema", "observedAt", "repository", "openPullRequests[].number", "openPullRequests[].state", "openPullRequests[].draft", "openPullRequests[].baseRef", "openPullRequests[].headSha", "runs[].pullRequestNumber", "runs[].workflow", "runs[].run.id", "runs[].run.headSha", "runs[].run.attempt", "runs[].run.latestAttempt", "runs[].run.status", "runs[].jobs[].id", "runs[].jobs[].runId", "runs[].jobs[].runAttempt", "runs[].jobs[].name", "runs[].jobs[].family", "runs[].jobs[].status", "runs[].jobs[].conclusion", "runs[].jobs[].labels", "runs[].jobs[].runnerId", "runs[].jobs[].runnerName", "runs[].jobs[].createdAt"],
+    "selectionRule": "Enumerate every open PR and, for every listed workflow, paginate runs through its fixed workflowApiId (never its sourcePath) filtered by that PR's live head SHA. Retain exactly one run whose attempt equals latestAttempt; reject a missing, duplicate, stale-head, stale-attempt, family, job, or exact-label record.",
+    "hostBindingBoundary": "GitHub snapshots carry job-to-Runner identity when assigned. ProjectManager's shadow collector independently binds any assigned Runner to the dedicated service and immutable terminal receipt; neither layer may substitute a fallback runner or infer teardown.",
+    "evidenceBoundary": "A locally validated snapshot proves only internal consistency with this source contract. Exact CI acceptance still needs live PR head, Actions run/job, runner identity/result, service binding, and teardown receipt evidence."
+  },
+  "projectManagerBridge": {
+    "schema": "sixlab-jit-pr-runner-correlation-v2",
+    "openPrCycleSchema": "sixlab-jit-open-pr-cycle-v1",
+    "selectionRule": "ProjectManager must explicitly select one validated workflow run for every open PR before constructing its one-run R1 shadow snapshot. It must not combine workflow runs or silently prefer SPA/backend.",
+    "requiredBindingFields": ["repository", "pull_number", "head_sha", "run_id", "run_attempt", "job_id", "family", "exact_label", "runner_id", "runner_name", "service_name"],
+    "teardownReceiptSchema": "sixlab-jit-teardown-receipt-v1"
+  },
+  "prExecutionWorkflows": [
+    {
+      "sourcePath": ".github/workflows/test.yml",
+      "workflowApiId": "test.yml",
+      "workflow": "test",
+      "event": "pull_request",
+      "requiredContext": "spa-checks",
+      "jobFamily": "spa",
+      "jobs": [
+        { "id": "spa-detect", "instances": 1 },
+        { "id": "spa-tests", "instances": 2, "matrix": { "shard": [1, 2], "maxParallel": 1 } },
+        { "id": "spa-checks", "instances": 1 }
+      ],
+      "exactLabelTemplate": "sixlab-pr-job-{headSha}-{jobId}",
+      "heavyConcurrencyTemplate": "sixlab-pr-untrusted-ephemeral-{prNumber}-{headSha}-spa-tests-{shard}",
+      "persistentFallback": "forbidden"
+    },
+    {
+      "sourcePath": ".github/workflows/test-backend.yml",
+      "workflowApiId": "test-backend.yml",
+      "workflow": "test-backend",
+      "event": "pull_request",
+      "requiredContext": "backend-unit",
+      "jobFamily": "backend",
+      "jobs": [
+        { "id": "backend-detect", "instances": 1 },
+        { "id": "backend-tests", "instances": 1 },
+        { "id": "backend-unit", "instances": 1 }
+      ],
+      "exactLabelTemplate": "sixlab-pr-job-{headSha}-{jobId}",
+      "heavyConcurrencyTemplate": "sixlab-pr-untrusted-ephemeral-{prNumber}-{headSha}-backend-tests",
+      "persistentFallback": "forbidden"
+    }
+  ],
+  "trustedControlWorkflows": [
+    {
+      "sourcePath": ".github/workflows/pr-peer-review-gate.yml",
+      "workflow": "peer-approval",
+      "events": ["pull_request_target", "workflow_run", "workflow_dispatch"],
+      "candidateCheckout": "forbidden",
+      "candidateExecution": "forbidden"
+    }
+  ]
+}

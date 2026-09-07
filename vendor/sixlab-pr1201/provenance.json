@@ -1,0 +1,17 @@
+{
+  "schema": "opcb-projectmanager-vendored-sixlab-pr1201-v1",
+  "source": {
+    "repository": "Steven-ZYH/sixlab",
+    "pullRequest": 1201,
+    "head": "1efdfd2d754822d29d4f0a4f93b48117a663116f"
+  },
+  "files": {
+    ".claude/ci-runner-automation-contract.v1.json": "57a0fd3d88a344bab7b6174742b3a1b10f02f0fd16e582bff1fba99bd2d83d61",
+    ".github/workflows/test-backend.yml": "233f8ecfa172361bc54d3c8c87ff0df5d0bf1d961fc23e54f6547631d2595ec8",
+    ".github/workflows/test.yml": "aee582274151a53c4b9ca27eee068f37fcc38b8dc460d1b09ad523daa644bd4a",
+    ".github/workflows/pr-peer-review-gate.yml": "7fed9a4e58a1d4c0cc665be804ac5071d3384ea02da08b3b9e36662b7c5ce7fc",
+    "scripts/ci/collect-pr-runner-correlation.mjs": "c3611524baf3e535ad4815898fa1c6cc791f777815e121674af280e3838cf021",
+    "scripts/ci/collect-pr-runner-correlation.test.mjs": "ba774eda78b020edf5a9189863f1f0529cc1cf80838a07b88178f9fe670b763f",
+    "scripts/ci/pr-runner-contract.mjs": "70a8cdb5fea2d0a5a04fb896336041dce80dd8cdf51663115bc96d65114e3e31"
+  }
+}
