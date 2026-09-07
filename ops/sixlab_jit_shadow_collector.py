@@ -9,6 +9,7 @@ workflow, service, filesystem cleanup, merge, or deployment mutation.
 from __future__ import annotations
 
 import argparse
+import errno
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -23,6 +24,7 @@ from typing import Any, Callable
 
 
 import sixlab_jit_shadow_controller as shadow
+from sixlab_jit_safe_input import read_regular
 
 
 EXPECTED_HOST = "124.221.116.56"
@@ -100,23 +102,114 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
+import selectors
+import signal
+import stat
 import subprocess
 import sys
+import time
 
 
 DEDICATED_UID = 1005
+TOOL_PATHS = {
+    "systemctl": "/usr/bin/systemctl", "sudo": "/usr/bin/sudo",
+    "nft": "/usr/sbin/nft", "iptables-save": "/usr/sbin/iptables-save",
+}
+COMMAND_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+PROBE_DEADLINE = time.monotonic() + 15
+COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024
+
+
+def trusted_tool(name):
+    if name not in TOOL_PATHS:
+        raise RuntimeError("unapproved probe tool")
+
+    def check(path, depth=0):
+        if depth > 64 or not path.is_absolute() or ".." in path.parts:
+            raise RuntimeError("unsafe probe tool path")
+        if path != path.parent:
+            check(path.parent, depth + 1)
+        metadata = path.lstat()
+        if metadata.st_uid != 0:
+            raise RuntimeError("probe tool path is not root-owned")
+        if stat.S_ISLNK(metadata.st_mode):
+            target = Path(os.readlink(path))
+            if not target.is_absolute():
+                target = path.parent / target
+            # Normalize root-owned distribution links such as alternatives.
+            target = Path(os.path.abspath(target))
+            check(target, depth + 1)
+        elif metadata.st_mode & 0o022:
+            raise RuntimeError("probe tool path is writable")
+
+    path = Path(TOOL_PATHS[name])
+    check(path)
+    resolved = path.resolve(strict=True)
+    check(resolved)
+    metadata = resolved.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & stat.S_IXUSR:
+        raise RuntimeError("probe tool is not an executable regular file")
+    return str(resolved)
 
 
 def command(arguments):
-    completed = subprocess.run(
-        arguments,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    return completed.returncode, completed.stdout
+    arguments = list(arguments)
+    name = arguments[0]
+    arguments[0] = trusted_tool(name)
+    if name == "sudo":
+        if len(arguments) < 3 or arguments[1] != "-n" or arguments[2] not in {"nft", "iptables-save"}:
+            raise RuntimeError("unapproved nested probe tool")
+        arguments[2] = trusted_tool(arguments[2])
+    remaining = PROBE_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("probe command deadline exceeded")
+    process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=COMMAND_ENV, start_new_session=True)
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    total = 0
+    killed = False
+    try:
+        for stream in (process.stdout, process.stderr):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        while True:
+            if time.monotonic() >= PROBE_DEADLINE:
+                raise RuntimeError("probe command deadline exceeded")
+            exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if exited is not None and not killed:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                killed = True
+            if killed and not selector.get_map():
+                break
+            for item, _ in selector.select(min(0.05, max(0, PROBE_DEADLINE - time.monotonic()))):
+                try:
+                    chunk = os.read(item.fd, min(65536, COMMAND_OUTPUT_LIMIT - total + 1))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(item.fileobj)
+                    continue
+                total += len(chunk)
+                if total > COMMAND_OUTPUT_LIMIT:
+                    raise RuntimeError("probe command output exceeds limit")
+                if item.fileobj is process.stdout:
+                    output.extend(chunk)
+        return process.wait(timeout=1), output.decode("utf-8")
+    finally:
+        if not killed:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=1)
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def systemd_services():
@@ -224,13 +317,8 @@ def mount_targets():
 
 
 def egress_tables():
-    nft = shutil.which("nft")
-    iptables_save = shutil.which("iptables-save")
-    sudo = shutil.which("sudo")
-    if nft is None or iptables_save is None or sudo is None:
-        return False, []
-    nft_code, nft_output = command([sudo, "-n", nft, "list", "tables"])
-    iptables_code, iptables_output = command([sudo, "-n", iptables_save])
+    nft_code, nft_output = command(["sudo", "-n", "nft", "list", "tables"])
+    iptables_code, iptables_output = command(["sudo", "-n", "iptables-save"])
     if nft_code != 0 or iptables_code != 0:
         return False, []
     rows = []
@@ -247,7 +335,7 @@ def egress_tables():
                 return False, []
             tables.append((fields[1], fields[2]))
     for family, name in tables:
-        table_code, table_output = command([sudo, "-n", nft, "list", "table", family, name])
+        table_code, table_output = command(["sudo", "-n", "nft", "list", "table", family, name])
         if table_code != 0:
             return False, []
         for line in table_output.splitlines():
@@ -267,16 +355,36 @@ def receipt_file(path):
     prefix = "/var/lib/sixlab-ephemeral-v1/receipts/"
     if not path.startswith(prefix) or "/" in path[len(prefix):]:
         raise RuntimeError("receipt path is outside the fixed directory")
-    target = Path(path)
-    metadata = target.lstat()
-    if not target.is_file() or target.is_symlink():
-        raise RuntimeError("receipt is not a regular file")
-    mode = metadata.st_mode & 0o777
-    if metadata.st_uid != 0 or mode not in (0o400, 0o444):
-        raise RuntimeError("receipt ownership or permissions are invalid")
-    if metadata.st_size > 4096:
-        raise RuntimeError("receipt is too large")
-    raw = target.read_bytes()
+    import stat
+    current = Path(path)
+    while True:
+        metadata = current.lstat()
+        if (metadata.st_uid != 0 or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_mode & 0o022):
+            raise RuntimeError("receipt ancestry is not root-safe")
+        if current == current.parent:
+            break
+        current = current.parent
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(descriptor)
+        listed = Path(path).lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_dev != listed.st_dev
+                or metadata.st_ino != listed.st_ino):
+            raise RuntimeError("receipt is not a regular file")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_uid != 0 or mode not in (0o400, 0o444):
+            raise RuntimeError("receipt ownership or permissions are invalid")
+        raw = b""
+        while True:
+            chunk = os.read(descriptor, 4097 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 4096:
+                raise RuntimeError("receipt is too large")
+    finally:
+        os.close(descriptor)
     return {
         "path": path,
         "mode": mode,
@@ -421,18 +529,18 @@ def _json_command(
 
 def _load_history(path: Path, pull_number: int) -> list[dict[str, str]]:
     try:
-        if not path.exists():
-            return []
-        metadata = path.lstat()
+        content = read_regular(path, MAX_HISTORY_BYTES, uid=os.getuid(), modes=(0o400, 0o600))
+    except FileNotFoundError:
+        return []
     except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise CollectorError("head history file is unsafe") from error
         raise CollectorError("head history file metadata is unavailable") from error
-    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_size > MAX_HISTORY_BYTES:
-        raise CollectorError("head history file is unsafe")
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) not in (0o400, 0o600):
-        raise CollectorError("head history file permissions are unsafe")
+    except ValueError as error:
+        raise CollectorError("head history file is unsafe") from error
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raw = json.loads(content)
+    except (UnicodeError, ValueError) as error:
         raise CollectorError("head history file is invalid") from error
     if (
         not isinstance(raw, dict)
@@ -1231,14 +1339,10 @@ def collect_live(
 
 
 def _canonical_input(path: Path, label: str) -> object:
-    if path.is_symlink():
-        raise CollectorError(f"{label} must not be a symlink")
     try:
-        raw = path.read_bytes()
-    except OSError as error:
+        raw = read_regular(path, 8 * 1024 * 1024)
+    except (OSError, ValueError) as error:
         raise CollectorError(f"{label} is unreadable") from error
-    if len(raw) > 8 * 1024 * 1024:
-        raise CollectorError(f"{label} exceeds byte limit")
     try:
         return json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

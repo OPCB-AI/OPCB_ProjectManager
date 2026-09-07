@@ -12,6 +12,9 @@ for test in \
   SIXLABJITShadowInventorySmoke.py \
   SIXLABJITShadowSoakSmoke.py \
   SIXLABJITSerialSchedulerSmoke.py \
+  SIXLABJITSafeInputSmoke.py \
+  SIXLABJITTrustedDeploymentSmoke.py \
+  SIXLABJITTrustedCycleSmoke.py \
   SIXLABJITProjectManagerBridgeSmoke.py \
   SIXLABJITProjectManagerBridgePairSmoke.py \
   SIXLABJITProjectManagerBridgeVendorSmoke.py \

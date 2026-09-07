@@ -133,4 +133,21 @@ finally:
         else:
             os.environ[name] = value
 
+# Production cannot promote caller-supplied evidence, even with plausible
+# timestamps or a forged trusted marker. Rejection precedes live collection.
+original_collect = bridge._collect_live_correlation
+def no_live_collection(*args, **kwargs):
+    raise AssertionError("disabled evidence path attempted live collection")
+bridge._collect_live_correlation = no_live_collection
+try:
+    for evidence in ({}, {42: {"trusted": True, "host": {"observed_at": "2020-01-01T00:00:00Z"}}}):
+        try:
+            bridge.build_cycle({42: "test"}, evidence)
+        except bridge.BridgeError as error:
+            assert "trusted same-window" in str(error)
+        else:
+            raise AssertionError("untrusted evidence admitted")
+finally:
+    bridge._collect_live_correlation = original_collect
+
 print("SIXLABJITProjectManagerBridgeProductionCollectorSmoke: PASS · manifest gate + isolated Node processes")

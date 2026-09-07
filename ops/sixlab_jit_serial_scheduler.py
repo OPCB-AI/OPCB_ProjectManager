@@ -134,14 +134,11 @@ def evaluate(cycle: object) -> dict[str, Any]:
 
 
 def load_cycle(path: Path) -> dict[str, Any]:
-    if path.is_symlink():
-        raise SerialSchedulerError("cycle input must not be a symlink")
+    from sixlab_jit_safe_input import read_regular
     try:
-        raw = path.read_bytes()
-    except OSError as error:
+        raw = read_regular(path, 8 * 1024 * 1024)
+    except (OSError, ValueError) as error:
         raise SerialSchedulerError("cycle input is inaccessible") from error
-    if len(raw) > 8 * 1024 * 1024:
-        raise SerialSchedulerError("cycle input exceeds byte limit")
     try:
         return _cycle(json.loads(raw))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

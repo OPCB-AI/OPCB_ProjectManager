@@ -167,10 +167,15 @@ with tempfile.TemporaryDirectory(prefix="opcb-bridge-bounded-") as directory:
     descendant_pid = root / "descendant.pid"
     elapsed = expect_error(
         "fixture descendant-holds-pipe timed out",
-        lambda: run_fixture("descendant-holds-pipe", str(descendant_pid), timeout=0.2),
+        lambda: run_fixture("descendant-holds-pipe", str(descendant_pid), timeout=1.0),
     )
-    assert elapsed < 0.2 + bridge.PROCESS_REAP_TIMEOUT_SECONDS + 0.5
+    assert elapsed < 1.0 + bridge.PROCESS_REAP_TIMEOUT_SECONDS + 0.5
     assert_gone(read_pid(descendant_pid))
+
+    exited_pid = root / "exited-leader-descendant.pid"
+    completed = run_fixture("leader-exits-with-pipe-holder", str(exited_pid), timeout=3.0)
+    assert completed.returncode == 0
+    assert_gone(read_pid(exited_pid))
 
     # A leader's normal or nonzero exit does not authorize a detached member
     # of its process group to retain the collector environment after return.

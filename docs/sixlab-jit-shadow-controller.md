@@ -193,6 +193,66 @@ For an explicitly selected completed job, it reads only the expected root-owned
 immutable receipt under `/var/lib/sixlab-ephemeral-v1/receipts/`, verifies its
 canonical six fields, and binds the source SHA-256 into the normalized receipt.
 
+The old production bridge `--evidence` path remains sealed. Caller `--cycle`
+inputs in actuator admission are diagnostic-only and can never produce
+`actuator-token-pending`. Production admission uses explicit `--selections`
+(one `test` or `test-backend` workflow per open PR) as intent, not evidence,
+and recollects inside the actuator process. The intended selected binding in
+`--schedule` must equal the freshly evaluated selection. No JSON `trusted`
+flag, receipt hash, historical head list or saved pending report is provenance.
+
+### Candidate same-process deployment contract (not installed or live-accepted)
+
+The fixed manifest `/etc/opcb/sixlab-jit-python-trust-v1.json` pins the Python
+and SSH executables, the exact ten-module dependency closure under
+`/var/lib/opcb/sixlab-jit/projectmanager/ops`, and the fixed root-owned SSH key
+and known-hosts files. The reviewed launcher template is digest-pinned too.
+The existing Node/vendor root trust manifest is required independently. All
+files and ancestor paths must be root-owned/non-writable by other principals;
+code/manifests/templates must be immutable by mode. Actual executing module
+origins and executable identity must match the installation. Missing or
+drifted deployment files fail closed. This change creates/installs none of them.
+
+The installed actuator must run under its pinned absolute Python with `-I -S`.
+Its fixed bootstrap adds only the installed ops directory, removes absent
+default search entries and rejects non-root-safe loaded dependencies/search
+paths. Neither PATH-selected binaries nor caller-owned modules are trusted.
+Root administration, the installed interpreter/standard library and the remote
+Ubuntu OS/SSH account and server-side shell are trust assumptions. Local SSH
+pinning cannot authenticate a compromised remote OS/account. SSH disables
+caller configuration, host-key learning, agents, multiplexing and proxies;
+host verification uses only the fixed known-hosts file. Probe subprocesses
+use fixed root-safe remote tools and a minimal environment.
+
+Candidate timing constants (not a measured production SLA): one shared
+monotonic **120-second** collection deadline, at most **30-second** final
+host/GitHub/Runner-read age at admission, and at most **5-second** host future
+skew. Every observation must fall inside its actual read window. Local wall
+clock versus monotonic drift also rejects. Child budgets use the remaining
+shared deadline, not a new 120 seconds per child. Checks run again after
+launcher rendering, so a late result cannot renew itself by serialization.
+
+Instead of introducing a persistent head journal, two real in-process
+all-PR observations are separated by at least the existing 60-second stability
+interval (61 seconds to avoid timestamp rounding). There is no caller history
+or journal to forge. Insufficient budget fails closed. The initial, stability
+and final post-host GitHub correlations must have identical whole-PR/run/
+attempt/job universes; the final read binds the selected head/attempt again.
+Full repository Runner inventory is separately paginated and reread; job
+bindings do not stand in for orphan inventory. Initial/final host identities
+and terminal receipts must agree. Every bound completed job, including those
+in unselected workflows, needs a root-owned exact receipt and verified clean
+teardown; missing or ambiguous receipt mappings reject. Any active job,
+allocated queued job or JIT inventory residue blocks new admission. This is
+an admission-only path, not a service reconciliation actuator.
+
+Production emits only a stdout diagnostic report, never a caller-selected
+root output-file write, command or Runner token. Even `actuator-token-pending`
+requires separate external authorization **and new collection in the future
+privileged consumer**; saving/editing this JSON cannot authorize execution.
+All implementation validation uses private offline I/O and clock seams. No
+public fixture input can opt into the trusted process path.
+
 Collector activation still requires reviewed merged control-repository code.
 Running this unmerged implementation for development may only produce a
 read-only shadow snapshot; its output cannot authorize token mint or service

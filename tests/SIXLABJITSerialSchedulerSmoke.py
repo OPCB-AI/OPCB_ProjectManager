@@ -84,13 +84,16 @@ assert schedule["runner_mutation_allowed"] is False
 assert schedule["token_transport"] == "stdin-short-lived-only"
 
 rendered, manifest = generator.render(1173, HEAD, 1, "01")
-admission = actuator.admit(schedule, cycle, manifest, rendered.encode())
-assert admission["status"] == "actuator-token-pending"
-assert admission["selected_job"] == schedule["selected_job"]
-assert admission["token_read"] is False
-assert admission["token_persisted"] is False
-assert admission["runner_mutation_allowed"] is False
-assert admission["launcher_rendered_sha256"] == manifest["rendered_sha256"]
+for host_time in ("2020-01-01T00:00:00Z", cycle["observed_at"]):
+    untrusted = copy.deepcopy(cycle)
+    for snapshot in untrusted["snapshots"]:
+        snapshot["host"]["observed_at"] = host_time
+    try:
+        actuator.admit(scheduler.evaluate(untrusted), untrusted, manifest, rendered.encode())
+    except actuator.ActuatorAdmissionError as error:
+        assert "trusted same-window" in str(error)
+    else:
+        raise AssertionError("caller-provided host evidence admitted")
 
 missing = copy.deepcopy(cycle)
 missing["open_pull_numbers"] = [1173]
@@ -176,8 +179,9 @@ with tempfile.TemporaryDirectory(prefix="sixlab-jit-serial.") as temporary:
         [sys.executable, str(ops / "sixlab_jit_actuator_admission.py"), "--schedule", str(schedule_path), "--cycle", str(cycle_path), "--launcher-manifest", str(manifest_path), "--launcher", str(launcher_path), "--output", str(admission_path)],
         check=False, capture_output=True, text=True,
     )
-    assert admitted.returncode == 0, admitted.stderr
-    assert json.loads(admission_path.read_text())["status"] == "actuator-token-pending"
+    assert admitted.returncode == 2, admitted.stderr
+    assert json.loads(admission_path.read_text())["status"] == "CHECK-INCOMPLETE"
+    assert "trusted same-window" in json.loads(admission_path.read_text())["blockers"][0]
     launcher_path.write_text(rendered + "# drift\n", encoding="utf-8")
     rejected = subprocess.run(
         [sys.executable, str(ops / "sixlab_jit_actuator_admission.py"), "--schedule", str(schedule_path), "--cycle", str(cycle_path), "--launcher-manifest", str(manifest_path), "--launcher", str(launcher_path)],

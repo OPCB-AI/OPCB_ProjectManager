@@ -727,7 +727,7 @@ for required in (
     "actions/runs/{run_id}",
     "actions/runners?per_page=100",
     '"live_mutation_allowed": False',
-    'shutil.which("iptables-save")',
+    '"iptables-save": "/usr/sbin/iptables-save"',
     'rows.append(f"iptables:{value}")',
     'rows.append(f"nft:{family}:{name}:{value}")',
     '"api", "--hostname", "github.com"',

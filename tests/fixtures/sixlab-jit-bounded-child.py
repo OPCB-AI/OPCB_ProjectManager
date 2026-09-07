@@ -29,7 +29,7 @@ elif mode == "hang":
     record_pid(arguments[0])
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(60)
-elif mode == "descendant-holds-pipe":
+elif mode in ("descendant-holds-pipe", "leader-exits-with-pipe-holder"):
     subprocess.Popen(
         [sys.executable, __file__, "hang", arguments[0]],
         stdin=subprocess.DEVNULL,
@@ -39,6 +39,9 @@ elif mode == "descendant-holds-pipe":
     deadline = time.monotonic() + 2.0
     while not Path(arguments[0]).exists() and time.monotonic() < deadline:
         time.sleep(0.01)
+    if mode == "descendant-holds-pipe":
+        time.sleep(60)
+    os._exit(0)
 elif mode == "descendant-closes-pipes":
     subprocess.Popen(
         [sys.executable, __file__, "hang", arguments[0]],

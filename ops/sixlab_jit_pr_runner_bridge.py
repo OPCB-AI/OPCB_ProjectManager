@@ -64,6 +64,7 @@ VALIDATOR_STDERR_LIMIT_BYTES = 256 * 1024
 PROCESS_REAP_TIMEOUT_SECONDS = 1.0
 PROCESS_IO_CHUNK_BYTES = 64 * 1024
 PROCESS_EXIT_POLL_SECONDS = 0.05
+TRUSTED_FILE_LIMIT_BYTES = 256 * 1024 * 1024
 
 
 class BridgeError(RuntimeError):
@@ -351,6 +352,7 @@ def _run_bounded_process(
 
 def _canonical_validation(
     correlation: object, validator: Path, node: Path, *, expected_validator: Path | None = None,
+    timeout_seconds: float = VALIDATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Run B's fixed validator and retain only its contract-derived output."""
     pinned_validator = expected_validator or _fixture_pinned_validator()
@@ -369,7 +371,7 @@ def _canonical_validation(
         # Validator input is untrusted correlation JSON.  It has no need for a
         # credential, PATH, Node flags/module paths, proxy, or CA settings.
         env={},
-        timeout_seconds=VALIDATOR_TIMEOUT_SECONDS,
+        timeout_seconds=min(VALIDATOR_TIMEOUT_SECONDS, timeout_seconds),
         stdout_limit_bytes=VALIDATOR_STDOUT_LIMIT_BYTES,
         stderr_limit_bytes=VALIDATOR_STDERR_LIMIT_BYTES,
         label="canonical SIXLAB validator",
@@ -428,7 +430,7 @@ def _verified_root_owned_file(
     subsequent subprocess path cannot be replaced by the checkout owner.
     """
     _root_owned_safe_path(path, label)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -444,11 +446,17 @@ def _verified_root_owned_file(
         ):
             raise BridgeError(f"{label} changed while it was verified")
         _safe_root_metadata(opened, label, immutable=immutable)
+        if opened.st_size > TRUSTED_FILE_LIMIT_BYTES:
+            raise BridgeError(f"{label} exceeds byte limit")
         chunks = []
+        size = 0
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            chunk = os.read(descriptor, min(1024 * 1024, TRUSTED_FILE_LIMIT_BYTES - size + 1))
             if not chunk:
                 break
+            size += len(chunk)
+            if size > TRUSTED_FILE_LIMIT_BYTES:
+                raise BridgeError(f"{label} exceeds byte limit")
             chunks.append(chunk)
         raw = b"".join(chunks)
     finally:
@@ -564,7 +572,8 @@ def _collector_environment() -> dict[str, str]:
     return {"GITHUB_TOKEN": token}
 
 
-def _collect_live_correlation(node: Path, installed_vendor: _InstalledVendor | None = None) -> object:
+def _collect_live_correlation(node: Path, installed_vendor: _InstalledVendor | None = None, *,
+                              timeout_seconds: float = COLLECTOR_TIMEOUT_SECONDS) -> object:
     """Run B's read-only GitHub collector; caller data cannot replace this.
 
     ``installed_vendor`` is mandatory for production.  The fallback exists
@@ -580,7 +589,7 @@ def _collect_live_correlation(node: Path, installed_vendor: _InstalledVendor | N
         [str(node), str(collector), "--stdout"],
         input_bytes=None,
         env=_collector_environment(),
-        timeout_seconds=COLLECTOR_TIMEOUT_SECONDS,
+        timeout_seconds=min(COLLECTOR_TIMEOUT_SECONDS, timeout_seconds),
         stdout_limit_bytes=COLLECTOR_STDOUT_LIMIT_BYTES,
         stderr_limit_bytes=COLLECTOR_STDERR_LIMIT_BYTES,
         label="canonical SIXLAB live collector",
@@ -603,6 +612,7 @@ def _build_from_validated_correlation(
     node: Path,
     *,
     installed_vendor: _InstalledVendor | None = None,
+    timeout_seconds: float = VALIDATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Build R1 observations after the SIXLAB validator accepts correlation.
 
@@ -620,6 +630,7 @@ def _build_from_validated_correlation(
         raise BridgeError("installed SIXLAB validator path drifted")
     validated = _canonical_validation(
         correlation, validator, node, expected_validator=canonical_validator,
+        timeout_seconds=timeout_seconds,
     )
     source = _record(correlation, {"schema", "observedAt", "repository", "openPullRequests", "runs"}, "correlation")
     if source["schema"] != CORRELATION_SCHEMA or source["repository"] != shadow.EXPECTED_REPOSITORY:
@@ -732,18 +743,12 @@ def _build_from_validated_correlation(
 
 
 def build_cycle(selections: object, evidence_by_pull: object) -> dict[str, Any]:
-    """Build a schedulable cycle from B's freshly collected live inventory."""
-    # The installed manifest binds the Node executable and the *installed*
-    # immutable B source.  The checkout vendor never crosses this boundary.
-    verified_node, installed_vendor = _trusted_runtime()
-    _same_verified_file(verified_node, "trusted Node executable")
-    node = verified_node.path
-    correlation = _collect_live_correlation(node, installed_vendor)
-    _same_verified_file(verified_node, "trusted Node executable")
-    return _build_from_validated_correlation(
-        correlation, selections, evidence_by_pull,
-        installed_vendor.executable_path("scripts/ci/pr-runner-contract.mjs"), node,
-        installed_vendor=installed_vendor,
+    """Fail closed until host/head/receipt evidence has a trusted producer."""
+    # Collector provenance authenticates GitHub correlation only.  Caller JSON
+    # cannot authenticate the accompanying host, history or receipt evidence.
+    # Do not collect a token-bearing live correlation for this disabled path.
+    raise BridgeError(
+        "trusted same-window host/head/receipt evidence is not implemented"
     )
 
 
